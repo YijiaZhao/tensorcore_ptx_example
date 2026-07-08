@@ -1,7 +1,8 @@
 # Tensor Core PTX 最小示例集
 
-每个 `.cu` 都是**单条 tensor core 指令的最小可跑验证**：全 1.0/1 输入 → 期望输出 = K（或 K×scale），
-一眼看出指令是否真的按预期执行。附带 SASS 对照，区分「原生硬件」和「编译器模拟」。
+每个 `.cu` 都是**单条 tensor core 指令的最小可跑验证**：随机数据（+随机 scale）喂给指令，
+与 CPU 参考逐 bit `==` 比对——布局、映射、格式解码、累加、scale 任何一环错都当场现形。
+附带 SASS 对照，区分「原生硬件」和「编译器模拟」。
 
 ```
 目录 = 架构 / 指令族_精度_适用sm[_模拟标记] / 文件.cu
@@ -188,7 +189,7 @@ docker run --rm --gpus all -v <本仓库路径>:/work \
            nvcc -gencode arch=compute_89,code=sm_89 -std=c++17 -o /tmp/$b $f && /tmp/$b | grep -E "Result|PASS"; done'
 ```
 
-### 随机数据 + CPU 参考验证（内嵌于每个 .cu + `random_cpu_ref/`）
+### 验证原理：随机数据 vs CPU 参考（内嵌于每个 .cu）
 
 **每个含 TC 指令的 .cu 的唯一验证方式就是随机数据 vs CPU 参考**（全 1.0 测试已删除——
 它对布局/映射错误不敏感，是随机验证的严格子集）：
@@ -207,22 +208,21 @@ docker run --rm --gpus all -v <本仓库路径>:/work \
 （{0,±0.5,±1,±1.5,±2}，保证任意累加顺序 fp32 零舍入 → 可用 `==`）、scale 编码表、
 确定性随机、mma fragment 下标、CPU 参考 GEMM（含 block-scale 版）、精确比对。
 
-跑法（-gencode 按第 5 节开头的架构表换）：
+随机种子固定 seed=1 写在各 main 里（确定性，任何机器结果可复现；要换 seed 改一处常量即可）：
 
 ```bash
-cd random_cpu_ref
-nvcc -gencode arch=compute_120a,code=sm_120a -std=c++17 -o t mma_random_cpu_ref_all_arch.cu
-./t          # 默认 seed=1, 每精度3轮; 期望每行 "PASS (128/128 exact)", 最后 "全部PASS"
-./t 42       # 换个 seed 复跑 (确定性随机, 同seed结果可复现)
+nvcc -gencode arch=compute_120a,code=sm_120a -std=c++17 -o t mma_fp8_*.cu
+./t          # 每行 "random rN PASS (128/128 exact)", 最后 "全部PASS", 退出码0
 # wgmma/tcgen05 版同理; tcgen05 版会先打印 "D布局探针: OK, 64/128 槽位一致有效"
 # 退出码: 0=全过, 非0=有FAIL (可以直接进CI)
 ```
 
-这套测试实际抓出过两个"全 1.0 全对、随机数据全错"的真问题（已修，教训写在文件头）：
+这套测试实际抓出过四个"全 1.0 全对、随机数据全错"的真问题（均已修，教训写在文件头）：
 1. **GMMA/UMMA smem descriptor 的 no-swizzle 布局不是线性行主**，是 8行×16B core-matrix 分块，
    K 方向 core-matrix 间距(LBO)=128B、M 方向(SBO)=256B —— 参数扫描实测钉死
-2. **`tcgen05.ld` 后必须 `tcgen05.wait::ld`**，否则读寄存器是竞态；且 TMEM dealloc/realloc
-   不清零，会读到上一个 kernel 的残留数据
+2. **`tcgen05.ld` 后必须 `tcgen05.wait::ld`**，否则读寄存器是竞态
+3. **TMEM dealloc/realloc 不清零**——会读到上一个 kernel 的残留数据（探针一致性过滤兜住）
+4. **多条 MMA 累加后 ld 前要 `tcgen05.commit` + mbarrier 等完成**——单条时侥幸，多 tile 现形
 
 ### SASS 对照(验证原生/模拟)
 
