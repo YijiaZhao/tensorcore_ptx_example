@@ -187,9 +187,20 @@ docker run --rm --gpus all -v <本仓库路径>:/work \
            nvcc -gencode arch=compute_89,code=sm_89 -std=c++17 -o /tmp/$b $f && /tmp/$b | grep -E "Result|PASS"; done'
 ```
 
-### 随机数据 + CPU 参考验证（`random_cpu_ref/`）
+### 随机数据 + CPU 参考验证（内嵌于每个 .cu + `random_cpu_ref/`）
 
-全 1.0 测试对布局/映射错误不敏感（输入对称，怎么排结果都一样）。`random_cpu_ref/` 补上这块：
+全 1.0 测试对布局/映射错误不敏感（输入对称，怎么排结果都一样）。因此**每个含 TC 指令的 .cu
+都内嵌两阶段验证**，跑任何示例都会依次执行：
+
+1. **阶段1（全 1.0）**：指令语义 smoke——格式解码、K 长度、累加、scale 生效
+2. **阶段2（随机 vs CPU）**：同一条指令，A/B 每元素独立随机（block scale 的 scale 也随机），
+   CPU 三重循环算参考，逐元素 `==` 精确比对——fragment 映射 / descriptor 布局 /
+   读回映射 / 完成同步，全 1.0 兜不住的错误全在这层现形。
+   tcgen05 类的 D 读回布局用 base-4 one-hot 探针真机实测（含 cta_group::2 双 CTA 256 槽位），
+   不依赖任何文档假设；一致性探针自动过滤 TMEM 跨 kernel 残留。
+   退出码 = 阶段2 结果（0=全过），可直接接 CI。
+
+`random_cpu_ref/` 提供公共件与独立版验证器：
 
 - **`verify_random.h`**（可复用）：各格式编码表、确定性随机、CPU 参考 GEMM、精确比对。
   取值集刻意限制在 {0, ±0.5, ±1, ±1.5, ±2} —— 任意乘加顺序在 fp32 里精确，
