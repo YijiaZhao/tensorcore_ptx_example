@@ -65,179 +65,7 @@ constexpr int THREADS = 128;
 constexpr int A_BYTES = M * K / 2;  // 4096
 constexpr int B_BYTES = N * K / 2;  // 256
 
-__global__ void tcgen05_nvfp4_kernel(float* D_out) {
-    extern __shared__ char smem[];
-    uint8_t*  smem_a    = (uint8_t*)smem;
-    uint8_t*  smem_b    = smem_a + A_BYTES;
-    uint32_t* smem_tmem = (uint32_t*)(smem_b + B_BYTES + 64);
-
-    int tid = threadIdx.x, warp_id = tid / 32, lane = tid % 32;
-
-    // A=B=FP4(1.0)=0x22
-    for (int i = tid; i < A_BYTES; i += THREADS) smem_a[i] = 0x22;
-    for (int i = tid; i < B_BYTES; i += THREADS) smem_b[i] = 0x22;
-    __syncthreads();
-
-    // TMEM alloc (整个warp 0)
-    if (warp_id == 0) {
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                     : : "r"(smem_u32(smem_tmem)), "r"(32));
-    }
-    __syncthreads();
-
-    uint32_t tmem_base = *smem_tmem;
-    uint32_t tmem_c    = tmem_base;
-    uint32_t tmem_sfa  = tmem_base + 8;
-    uint32_t tmem_sfb  = tmem_base + 12;
-
-    // 写scale: ue4m3(1.0) = 0x38
-    uint32_t sf_val = 0x38383838u;
-    if (warp_id == 0) {
-        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};\n"
-                     : : "r"(tmem_sfa), "r"(sf_val), "r"(sf_val), "r"(sf_val), "r"(sf_val));
-    }
-    __syncthreads();
-    if (warp_id == 0) {
-        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};\n"
-                     : : "r"(tmem_sfb), "r"(sf_val), "r"(sf_val), "r"(sf_val), "r"(sf_val));
-    }
-    __syncthreads();
-
-    uint64_t desc_a = make_desc(smem_a, K / 2);
-    uint64_t desc_b = make_desc(smem_b, K / 2);
-    uint32_t idesc  = make_idesc(tmem_sfa, tmem_sfb);
-
-    // tcgen05.mma NVFP4 (1个线程发射)
-    __syncthreads();
-    if (tid == 0) {
-        asm volatile(
-            "{\n\t"
-            ".reg .pred p;\n\t"
-            "setp.ne.b32 p, %4, 0;\n\t"
-            "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X "
-            "[%0], %1, %2, %3, [%5], [%6], p;\n\t"
-            "}\n"
-            : : "r"(tmem_c), "l"(desc_a), "l"(desc_b),
-                "r"(idesc), "r"(0u), "r"(tmem_sfa), "r"(tmem_sfb));
-    }
-    __syncthreads();
-
-    // 读TMEM
-    if (warp_id == 0) {
-        uint32_t r0, r1, r2, r3;
-        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n\t"
-                     "tcgen05.wait::ld.sync.aligned;\n"
-                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(tmem_c));
-        D_out[lane * 4 + 0] = __uint_as_float(r0);
-        D_out[lane * 4 + 1] = __uint_as_float(r1);
-        D_out[lane * 4 + 2] = __uint_as_float(r2);
-        D_out[lane * 4 + 3] = __uint_as_float(r3);
-    }
-
-    // 释放TMEM
-    __syncthreads();
-    if (warp_id == 0) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                     : : "r"(tmem_base), "r"(32));
-    }
-}
-
-// ============================================================
-// TS变体: A在TMEM (kind::mxf4nvf4 + block_scale)
-//
-// CUTLASS没实现这个变体,但硬件实测支持!
-// 指令: tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X
-//       [tmem_c], [tmem_a], desc_b, idesc, [tmem_sfa], [tmem_sfb], p
-//                  ↑ A在TMEM (TS)
-//
-// 与SS的区别: desc_a (smem descriptor) → [tmem_a] (TMEM地址)
-// ============================================================
-__global__ void tcgen05_nvfp4_ts_kernel(float* D_out) {
-    extern __shared__ char smem[];
-    uint8_t*  smem_b    = (uint8_t*)smem;        // 只需B在smem
-    uint32_t* smem_tmem = (uint32_t*)(smem_b + B_BYTES + 64);
-
-    int tid = threadIdx.x, warp_id = tid / 32, lane = tid % 32;
-
-    // B=FP4(1.0)=0x22
-    for (int i = tid; i < B_BYTES; i += THREADS) smem_b[i] = 0x22;
-    __syncthreads();
-
-    // TMEM alloc: D + A + scale
-    if (warp_id == 0) {
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                     : : "r"(smem_u32(smem_tmem)), "r"(32));
-    }
-    __syncthreads();
-
-    uint32_t tmem_base = *smem_tmem;
-    uint32_t tmem_c    = tmem_base;
-    uint32_t tmem_a    = tmem_base + 8;   // A在TMEM
-    uint32_t tmem_sfa  = tmem_base + 16;
-    uint32_t tmem_sfb  = tmem_base + 20;
-
-    // 写A=FP4(1.0)到TMEM
-    if (warp_id == 0) {
-        uint32_t v = 0x22222222u;
-        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};\n"
-                     : : "r"(tmem_a), "r"(v), "r"(v), "r"(v), "r"(v));
-    }
-    __syncthreads();
-
-    // 写scale: ue4m3(1.0) = 0x38
-    uint32_t sf_val = 0x38383838u;
-    if (warp_id == 0) {
-        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};\n"
-                     : : "r"(tmem_sfa), "r"(sf_val), "r"(sf_val), "r"(sf_val), "r"(sf_val));
-    }
-    __syncthreads();
-    if (warp_id == 0) {
-        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};\n"
-                     : : "r"(tmem_sfb), "r"(sf_val), "r"(sf_val), "r"(sf_val), "r"(sf_val));
-    }
-    __syncthreads();
-
-    uint64_t desc_b = make_desc(smem_b, K / 2);
-    uint32_t idesc  = make_idesc(tmem_sfa, tmem_sfb);
-
-    // tcgen05.mma TS: [tmem_c], [tmem_a], desc_b, idesc, [tmem_sfa], [tmem_sfb], p
-    __syncthreads();
-    if (tid == 0) {
-        asm volatile(
-            "{\n\t"
-            ".reg .pred p;\n\t"
-            "setp.ne.b32 p, %4, 0;\n\t"
-            "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X "
-            "[%0], [%1], %2, %3, [%5], [%6], p;\n\t"
-            "}\n"
-            : : "r"(tmem_c),      // [tmem_c]:   D在TMEM
-                "r"(tmem_a),      // [tmem_a]:   A在TMEM ← TS!
-                "l"(desc_b),      // desc_b:     B在smem
-                "r"(idesc),
-                "r"(0u),
-                "r"(tmem_sfa), "r"(tmem_sfb));
-    }
-    __syncthreads();
-
-    // 读TMEM
-    if (warp_id == 0) {
-        uint32_t r0, r1, r2, r3;
-        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n\t"
-                     "tcgen05.wait::ld.sync.aligned;\n"
-                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(tmem_c));
-        D_out[lane * 4 + 0] = __uint_as_float(r0);
-        D_out[lane * 4 + 1] = __uint_as_float(r1);
-        D_out[lane * 4 + 2] = __uint_as_float(r2);
-        D_out[lane * 4 + 3] = __uint_as_float(r3);
-    }
-
-    __syncthreads();
-    if (warp_id == 0) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                     : : "r"(tmem_base), "r"(32));
-    }
-}
-
+// (原阶段1全1.0测试已移除: SS随机+TS提取法为严格超集 — PHASE1_STRIPPED)
 
 // ============================================================
 // 阶段2: 随机数据 + 随机scale vs CPU 参考 (逐bit精确)
@@ -385,49 +213,152 @@ static int phase2_random_vs_cpu(uint32_t seed) {
     return bad ? 1 : 0;
 }
 
+
+// ============================================================
+// 阶段2-TS: A在TMEM 的随机验证 (提取法)
+//   tcgen05.st 的 TMEM 数据布局无文档假设可依 —— 不猜, 直接测:
+//   1) 随机 e2m1 经 st 写入 TMEM-A (布局未知也无妨)
+//   2) 64轮 B one-hot(第k0列=1): D[m][n]=A_eff[m][k0] → 把硬件实际看到的A整个读出
+//   3) 随机B + 随机scale, CPU用 A_eff 算参考, 逐bit == 比对 TS MMA
+// ============================================================
+
+__global__ void phase2_ts_kernel(const uint32_t* a_regs, const uint8_t* B, uint32_t* D_raw,
+                                 uint32_t sfa_splat, uint32_t sfb_splat) {
+    extern __shared__ char smem[];
+    uint32_t* sB = (uint32_t*)smem;
+    uint32_t* s_tmem = (uint32_t*)(smem + B_BYTES + 64);
+    int tid = threadIdx.x, warp_id = tid / 32, lane = tid % 32;
+    for (int i = tid; i < B_BYTES / 4; i += THREADS) sB[i] = ((const uint32_t*)B)[i];
+    __syncthreads();
+    if (warp_id == 0)
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                     : : "r"(smem_u32(s_tmem)), "r"(32));
+    __syncthreads();
+    uint32_t tmem_c = *s_tmem;
+    uint32_t tmem_a = tmem_c + 8, tmem_sfa = tmem_c + 16, tmem_sfb = tmem_c + 20;
+    if (warp_id == 0) {
+        uint32_t r0 = a_regs[lane*4+0], r1 = a_regs[lane*4+1],
+                 r2 = a_regs[lane*4+2], r3 = a_regs[lane*4+3];
+        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};"
+                     : : "r"(tmem_a), "r"(r0), "r"(r1), "r"(r2), "r"(r3));
+        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};"
+                     : : "r"(tmem_sfa), "r"(sfa_splat), "r"(sfa_splat), "r"(sfa_splat), "r"(sfa_splat));
+        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};"
+                     : : "r"(tmem_sfb), "r"(sfb_splat), "r"(sfb_splat), "r"(sfb_splat), "r"(sfb_splat));
+        asm volatile("tcgen05.wait::st.sync.aligned;");
+    }
+    __syncthreads();
+    uint64_t db = make_desc(sB, 32);
+    uint32_t idesc = make_idesc(tmem_sfa, tmem_sfb);
+    __syncthreads();
+    if (tid == 0) {
+        asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X "
+            "[%0], [%1], %2, %3, [%5], [%6], p;\n\t}\n"
+            : : "r"(tmem_c), "r"(tmem_a), "l"(db), "r"(idesc), "r"(0u),
+                "r"(tmem_sfa), "r"(tmem_sfb));
+    }
+    __syncthreads();
+    if (warp_id == 0) {
+        uint32_t r0, r1, r2, r3;
+        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n\t"
+                     "tcgen05.wait::ld.sync.aligned;\n"
+                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(tmem_c));
+        D_raw[lane*4+0]=r0; D_raw[lane*4+1]=r1; D_raw[lane*4+2]=r2; D_raw[lane*4+3]=r3;
+    }
+    __syncthreads();
+    if (warp_id == 0)
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                     : : "r"(tmem_c), "r"(32));
+}
+
+static int phase2_ts_random(uint32_t seed) {
+    const int ROUNDS = 3;
+    printf("\n====== 阶段2-TS: A在TMEM 提取法随机验证 (seed=%u) ======\n", seed);
+    // -- D 布局: 复用SS探针框架 (D读回代码相同) --
+    uint8_t *dA, *dB; uint32_t *dD, *dAreg;
+    CHECK_CUDA(cudaMalloc(&dA, A_BYTES)); CHECK_CUDA(cudaMalloc(&dB, B_BYTES));
+    CHECK_CUDA(cudaMalloc(&dD, 512)); CHECK_CUDA(cudaMalloc(&dAreg, 512));
+    static int pr[4][128], pc[2][128], pchk[128], mrow[128], mcol[128];
+    static bool valid[128];
+    for (int d = 0; d < 4; d++) phase2_probe(dA, dB, dD, d, -1, 0, pr[d]);
+    for (int d = 0; d < 2; d++) phase2_probe(dA, dB, dD, -1, d, 0, pc[d]);
+    phase2_probe(dA, dB, dD, 0, -1, 1, pchk);
+    int nvalid = 0; static bool seen[128][8]; memset(seen, 0, sizeof(seen));
+    for (int sl = 0; sl < 128; sl++) {
+        int row = pr[0][sl] + 4*pr[1][sl] + 16*pr[2][sl] + 64*pr[3][sl];
+        int col = pc[0][sl] + 4*pc[1][sl];
+        bool ok = true;
+        for (int d = 0; d < 4; d++) if (pr[d][sl] < 0 || pr[d][sl] > 3) ok = false;
+        for (int d = 0; d < 2; d++) if (pc[d][sl] < 0 || pc[d][sl] > 3) ok = false;
+        ok = ok && row < M && col < N && pchk[sl] == 2*pr[0][sl] && !seen[row][col%8];
+        valid[sl] = ok; mrow[sl] = row; mcol[sl] = col;
+        if (ok) { seen[row][col%8] = true; nvalid++; }
+    }
+    printf("D布局探针(SS): %d/128 槽位\n", nvalid);
+    if (nvalid < 32) return 1;
+
+    // -- 随机A(经st入TMEM, 布局未知) --
+    static uint32_t a_regs[128]; static float hDf[128];
+    for (int i = 0; i < 128; i++) {
+        uint32_t w = 0;
+        for (int nib = 0; nib < 8; nib++)
+            w |= (E2M1_SET[xorshift(&seed) % SETN(E2M1_SET)].enc & 0xF) << (4*nib);
+        a_regs[i] = w;
+    }
+    CHECK_CUDA(cudaMemcpy(dAreg, a_regs, 512, cudaMemcpyHostToDevice));
+    auto ts_run = [&](uint32_t sfa, uint32_t sfb) {
+        CHECK_CUDA(cudaMemcpy(dB, p2_hB, B_BYTES, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemset(dD, 0, 512));
+        phase2_ts_kernel<<<1, THREADS, B_BYTES + 128>>>(dAreg, dB, dD, sfa, sfb);
+        CHECK_CUDA(cudaDeviceSynchronize());
+        uint32_t raw[128]; CHECK_CUDA(cudaMemcpy(raw, dD, 512, cudaMemcpyDeviceToHost));
+        for (int i = 0; i < 128; i++) memcpy(&hDf[i], &raw[i], 4);
+    };
+    // -- 提取 A_eff: 64轮 B one-hot --
+    static float A_eff[128][64]; static bool row_known[128];
+    memset(row_known, 0, sizeof(row_known));
+    for (int k0 = 0; k0 < K; k0++) {
+        memset(p2_hB, 0, B_BYTES);
+        for (int n = 0; n < N; n++) pack_set(p2_hB, n * K + k0, 0x2 /*e2m1 1.0*/, 4);
+        phase2_to_core_matrix(p2_hB, N);
+        ts_run(0x38383838u, 0x38383838u);   // sf=1.0
+        for (int sl = 0; sl < 128; sl++)
+            if (valid[sl]) { A_eff[mrow[sl]][k0] = hDf[sl]; row_known[mrow[sl]] = true; }
+    }
+    int known = 0; for (int m = 0; m < M; m++) if (m < 128 && row_known[m]) known++;
+    printf("A_eff 提取: %d 行\n", known);
+    // -- 随机B + 随机scale, CPU用A_eff做参考 --
+    static float refB[8 * 64], refD[128 * 8];
+    int bad = 0;
+    for (int r = 0; r < ROUNDS; r++) {
+        const EncVal& ea = UE4M3_SET[xorshift(&seed) % SETN(UE4M3_SET)];
+        const EncVal& eb = UE4M3_SET[xorshift(&seed) % SETN(UE4M3_SET)];
+        memset(p2_hB, 0, B_BYTES);
+        fill_random(p2_hB, refB, N, K, E2M1_SET, SETN(E2M1_SET), 4, &seed);
+        phase2_to_core_matrix(p2_hB, N);
+        for (int m = 0; m < M; m++)
+            for (int n = 0; n < N; n++) {
+                float acc = 0.f;
+                for (int k = 0; k < K; k++) acc += A_eff[m][k] * refB[n*K+k];
+                refD[m*N+n] = ea.val * eb.val * acc;
+            }
+        ts_run(ea.enc * 0x01010101u, eb.enc * 0x01010101u);
+        float got[128], want[128]; int nv = 0;
+        for (int sl = 0; sl < 128; sl++) {
+            if (!valid[sl] || !row_known[mrow[sl]]) continue;
+            got[nv] = hDf[sl]; want[nv] = refD[mrow[sl]*N + mcol[sl]]; nv++;
+        }
+        char tag[16]; snprintf(tag, sizeof(tag), "TS random r%d", r);
+        bad += check_exact(got, want, nv, tag);
+    }
+    cudaFree(dA); cudaFree(dB); cudaFree(dD); cudaFree(dAreg);
+    printf("====== 阶段2-TS %s ======\n", bad ? "FAIL" : "全部PASS");
+    return bad ? 1 : 0;
+}
+
 int main() {
-    float *d_out, h[128];
-    CHECK_CUDA(cudaMalloc(&d_out, 4096));
-
-    // ---- SS: NVFP4 block16 (A=smem, B=smem, 有scale) ----
-    printf("====== SS: NVFP4 block16 (tcgen05.mma, sm_100) ======\n");
-    printf("kind::mxf4nvf4.block_scale.scale_vec::4X\n");
-    printf("A=smem, B=smem, scale=ue4m3(1.0)\n");
-    printf("M=%d N=%d K=%d, expect D=64.0\n\n", M, N, K);
-
-    CHECK_CUDA(cudaMemset(d_out, 0, 4096));
-    tcgen05_nvfp4_kernel<<<1, THREADS, 8192>>>(d_out);
-    cudaError_t e = cudaDeviceSynchronize();
-    if (e) { printf("Error: %s\n\n", cudaGetErrorString(e)); }
-    else {
-        CHECK_CUDA(cudaMemcpy(h, d_out, 128 * sizeof(float), cudaMemcpyDeviceToHost));
-        int pass = 0;
-        for (int i = 0; i < 128; i++) if (h[i] == 64.0f) pass++;
-        printf("Result: %d/128 correct (=64.0)\n", pass);
-        printf("D[0:8]: %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n\n",
-               h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-    }
-
-    // ---- TS: NVFP4 block16 (A=TMEM, B=smem, 有scale) ----
-    printf("====== TS: NVFP4 block16 A=TMEM (tcgen05.mma, sm_100) ======\n");
-    printf("kind::mxf4nvf4.block_scale.scale_vec::4X\n");
-    printf("A=TMEM, B=smem, scale=ue4m3(1.0)\n");
-    printf("M=%d N=%d K=%d, expect D=64.0\n", M, N, K);
-    printf("Note: CUTLASS未实现此变体, 但硬件实测支持\n\n");
-
-    CHECK_CUDA(cudaMemset(d_out, 0, 4096));
-    tcgen05_nvfp4_ts_kernel<<<1, THREADS, 8192>>>(d_out);
-    e = cudaDeviceSynchronize();
-    if (e) { printf("Error: %s\n\n", cudaGetErrorString(e)); }
-    else {
-        CHECK_CUDA(cudaMemcpy(h, d_out, 128 * sizeof(float), cudaMemcpyDeviceToHost));
-        int pass = 0;
-        for (int i = 0; i < 128; i++) if (h[i] == 64.0f) pass++;
-        printf("Result: %d/128 correct (=64.0)\n", pass);
-        printf("D[0:8]: %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n",
-               h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-    }
-
-    cudaFree(d_out);
-    return phase2_random_vs_cpu(1);
+    int rc = phase2_random_vs_cpu(1);   // SS
+    rc |= phase2_ts_random(1);          // TS
+    return rc;
 }
