@@ -187,6 +187,24 @@ docker run --rm --gpus all -v <本仓库路径>:/work \
            nvcc -gencode arch=compute_89,code=sm_89 -std=c++17 -o /tmp/$b $f && /tmp/$b | grep -E "Result|PASS"; done'
 ```
 
+### 随机数据 + CPU 参考验证（`random_cpu_ref/`）
+
+全 1.0 测试对布局/映射错误不敏感（输入对称，怎么排结果都一样）。`random_cpu_ref/` 补上这块：
+
+- **`verify_random.h`**（可复用）：各格式编码表、确定性随机、CPU 参考 GEMM、精确比对。
+  取值集刻意限制在 {0, ±0.5, ±1, ±1.5, ±2} —— 任意乘加顺序在 fp32 里精确，
+  所以 CPU float 和 tensor core 结果可以逐 bit `==` 比对，无容差。
+- **`mma_random_cpu_ref_all_arch.cu`**：六精度 mma.sync，fragment 映射按 PTX 布局装载，四架构通用
+- **`wgmma_random_cpu_ref_sm90.cu`**：五精度 wgmma，smem 按 core-matrix 布局排
+- **`tcgen05_random_cpu_ref_sm100.cu`**：五精度 tcgen05，D 读回布局用 one-hot 探针实测（不做假设），
+  一致性探针自动过滤 TMEM 跨 kernel 残留槽位
+
+这套测试实际抓出过两个"全 1.0 全对、随机数据全错"的真问题（已修，教训写在文件头）：
+1. **GMMA/UMMA smem descriptor 的 no-swizzle 布局不是线性行主**，是 8行×16B core-matrix 分块，
+   K 方向 core-matrix 间距(LBO)=128B、M 方向(SBO)=256B —— 参数扫描实测钉死
+2. **`tcgen05.ld` 后必须 `tcgen05.wait::ld`**，否则读寄存器是竞态；且 TMEM dealloc/realloc
+   不清零，会读到上一个 kernel 的残留数据
+
 ### SASS 对照(验证原生/模拟)
 
 ```bash
