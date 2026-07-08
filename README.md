@@ -142,23 +142,69 @@ blackwell/                          sm_100a (tcgen05) + sm_120a (mma.sync 扩展
   ptx_inline_asm_shl_demo.cu        PTX 内联汇编入门 (与 tensor core 无关)
 ```
 
-## 5. 编译与验证
+## 5. 怎么编译、怎么跑
+
+### 环境：统一 docker 镜像（宿主机零依赖）
+
+所有实测用同一个镜像（自带 nvcc，CUDA 13.0，支持 sm_89~sm_121a）：
+
+```
+nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu22.04
+```
+
+### 每个 .cu 的通用跑法
+
+每个文件都是自包含单文件，无任何外部依赖，三步：**编译 → 运行 → 看 Result/PASS 行**。
+编译指令写在每个 .cu 的头注释里，只有 `-gencode` 按架构换：
+
+| 架构 | -gencode | 测试卡 |
+|---|---|---|
+| ada (sm_89) | `arch=compute_89,code=sm_89` | L40 |
+| hopper (sm_90a) | `arch=compute_90a,code=sm_90a` | H20 |
+| blackwell tcgen05 (sm_100a) | `arch=compute_100a,code=sm_100a` | B200 |
+| blackwell mma.sync 扩展 (sm_120a) | `arch=compute_120a,code=sm_120a` | RTX PRO 6000 |
 
 ```bash
-# 每个文件头都有对应架构的编译行, 例:
-nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 -o x tcgen05_fp8.cu   # B200
-nvcc -gencode arch=compute_90a,code=sm_90a  -std=c++17 -o x wgmma_fp8.cu      # H100/H20
-nvcc -gencode arch=compute_120a,code=sm_120a -o x mma_mxfp8_block32_ue8m0_sm120only.cu  # 6000D
+# 例: 在 B200 上跑一个 tcgen05 例子
+nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 -o /tmp/t tcgen05_fp8.cu && /tmp/t
+# 输出: Result: 128/128 correct (=32.0)  ← 全对即硬件行为符合预期
+
+# 批量跑一个目录 (架构对应换 -gencode):
+for f in */*.cu; do b=$(basename $f .cu)
+  nvcc -gencode arch=compute_120a,code=sm_120a -std=c++17 -o /tmp/$b $f && /tmp/$b | grep -E "Result|PASS"
+done
+```
+
+注: `tcgen05_*` 需要 `-std=c++17`；`mma_bf16_sass_compare_sm89_sm120.cu` 是纯 SASS 观察 stub（无 main），
+只能 `-cubin` 编译后 `cuobjdump -sass` 看，不能运行。
+
+### 宿主机没有 CUDA 工具链时（docker 跑法，零依赖）
+
+```bash
+docker run --rm --gpus all -v <本仓库路径>:/work \
+  nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu22.04 \
+  bash -c 'cd /work/ada && for f in */*.cu; do b=$(basename $f .cu);
+           nvcc -gencode arch=compute_89,code=sm_89 -std=c++17 -o /tmp/$b $f && /tmp/$b | grep -E "Result|PASS"; done'
+```
+
+### SASS 对照(验证原生/模拟)
+
+```bash
+nvcc -gencode arch=compute_XXa,code=sm_XXa -cubin -o x.cubin x.cu
+cuobjdump -sass x.cubin | grep -oE "(H|Q|I)G?MMA[A-Z0-9._]*|F2FP[A-Z0-9._]*|IMAD.SHL" | sort | uniq -c
+# 单条 *MMA = 原生; 出现 F2FP(fp8上转) 或大量 IMAD.SHL(int4解包) 前奏 = 模拟
 ```
 
 验证状态（2026-07，CUDA 13.0）：
 
 | 目录 | 真机运行 | 编译+SASS |
 |---|---|---|
-| blackwell tcgen05/mma.sync 全部精度 | ✅ B200 | ✅ |
+| blackwell tcgen05 (sm_100) | ✅ B200 | ✅ |
+| blackwell mma.sync (sm_120, 含 fp4/mxfp8/原生fp8) | ✅ RTX PRO 6000 Blackwell | ✅ QMMA.SF 等 |
 | hopper wgmma + mma.sync 全部 | ✅ H20 | ✅ |
-| ada 全部 | 待 Ada 卡 | ✅ sm_89 全原生单指令 |
-| blackwell sm_120 专属 (fp4/mxfp8) | 待 6000D | ✅ QMMA.SF 等 |
+| ada 全部 (原生 fp8 QMMA + 末代 int4 IMMA.S4) | ✅ L40 | ✅ 全原生单指令 |
+| comm/ P2P + TMA | ✅ GB200 ×4 | — |
+| comm/ multimem (需 NVSwitch multicast) | ✅ B200 ×8 (NVL4 小机型不支持, check 工具可探测) | — |
 
 SASS 检查方法: `cuobjdump -sass x.cubin | grep -E "MMA|GMMA|F2FP|IMAD.SHL"`
 （看到 F2FP/IMAD.SHL 前奏 = 模拟路径; 单条 *MMA = 原生）
