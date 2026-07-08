@@ -126,9 +126,17 @@ __device__ __forceinline__ int mma_d_idx(int lane, int r) {   // D[16][8] 的 fl
 }
 #endif
 
-// ---- block scale 的 scale 编码表 (取值同样保证精确: 2的幂 + 1.5) ----
-static const EncVal UE8M0_SET[] = {{0x7E,0.5f},{0x7F,1.f},{0x80,2.f}};
-static const EncVal UE4M3_SET[] = {{0x30,0.5f},{0x38,1.f},{0x3C,1.5f},{0x40,2.f}};
+// ---- block scale 的 scale 编码表 ----
+// 范围由精确性约束推出: 各项数量级差 × 项数 必须落在 fp32 24bit 尾数预算内,
+// 否则大数吃小数、累加顺序敏感, == 比对失效。
+// ue8m0 纯2的幂(乘法零舍入): 指数 ±3 → 7档
+static const EncVal UE8M0_SET[] = {
+    {0x7C,0.125f},{0x7D,0.25f},{0x7E,0.5f},{0x7F,1.f},{0x80,2.f},{0x81,4.f},{0x82,8.f}};
+// ue4m3 带尾数(尾数相乘吃精度预算): 指数{0.5,1,2} × 偶尾数{1,1.25,1.5,1.75} → 12档
+static const EncVal UE4M3_SET[] = {
+    {0x30,0.5f},{0x32,0.625f},{0x34,0.75f},{0x36,0.875f},
+    {0x38,1.f},{0x3A,1.25f},{0x3C,1.5f},{0x3E,1.75f},
+    {0x40,2.f},{0x42,2.5f},{0x44,3.f},{0x46,3.5f}};
 
 // CPU 参考(带 per-K-segment scale, scale 对所有行广播):
 //   D[m][n] = Σ_seg sfa[seg]*sfb[seg] * Σ_{k∈seg} A[m][k]*B[n][k]

@@ -56,90 +56,7 @@ constexpr int THREADS = 128;  // cta_group::1 = 4 warps
 constexpr int A_BYTES = M * K / 2;  // 4096
 constexpr int B_BYTES = N * K / 2;  // 8192
 
-__global__ void tcgen05_nvfp4_max_kernel(float* D_out) {
-    extern __shared__ char smem[];
-    uint8_t*  smem_a    = (uint8_t*)smem;
-    uint8_t*  smem_b    = smem_a + A_BYTES;
-    uint32_t* smem_tmem = (uint32_t*)(smem_b + B_BYTES + 64);
-
-    int tid = threadIdx.x, warp_id = tid / 32, lane = tid % 32;
-
-    for (int i = tid; i < A_BYTES; i += THREADS) smem_a[i] = 0x22;
-    for (int i = tid; i < B_BYTES; i += THREADS) smem_b[i] = 0x22;
-    __syncthreads();
-
-    // TMEM alloc — cta_group::2 用更多列
-    // D[256×256] f32 需要256列, scale也需要列
-    // TMEM max = 512列
-    if (warp_id == 0) {
-        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
-                     : : "r"(smem_u32(smem_tmem)), "r"(512));
-    }
-    __syncthreads();
-
-    uint32_t tmem_base = *smem_tmem;
-    uint32_t tmem_c    = tmem_base;
-    uint32_t tmem_sfa  = tmem_base + 256;  // after D's 256 columns
-    uint32_t tmem_sfb  = tmem_base + 300;
-
-    // 写scale: ue4m3(1.0) = 0x38
-    uint32_t sf_val = 0x38383838u;
-    if (warp_id == 0) {
-        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};\n"
-                     : : "r"(tmem_sfa), "r"(sf_val), "r"(sf_val), "r"(sf_val), "r"(sf_val));
-    }
-    __syncthreads();
-    if (warp_id == 0) {
-        asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};\n"
-                     : : "r"(tmem_sfb), "r"(sf_val), "r"(sf_val), "r"(sf_val), "r"(sf_val));
-    }
-    __syncthreads();
-
-    uint64_t desc_a = make_desc(smem_a, K / 2);
-    uint64_t desc_b = make_desc(smem_b, K / 2);
-    uint32_t idesc  = make_idesc(tmem_sfa, tmem_sfb);
-
-    if (tid == 0) {
-        printf("NVFP4 MAX: M=%d N=%d K=%d, cta_group::2 (8 warps)\n", M, N, K);
-        printf("FMA per instruction: %d\n", M * N * K);
-        printf("tmem: c=0x%x sfa=0x%x sfb=0x%x\n", tmem_c, tmem_sfa, tmem_sfb);
-        printf("idesc=0x%08x\n", idesc);
-    }
-    __syncthreads();
-
-    // tcgen05.mma cta_group::2
-    if (tid == 0) {
-        asm volatile(
-            "{\n\t"
-            ".reg .pred p;\n\t"
-            "setp.ne.b32 p, %4, 0;\n\t"
-            "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X "
-            "[%0], %1, %2, %3, [%5], [%6], p;\n\t"
-            "}\n"
-            : : "r"(tmem_c), "l"(desc_a), "l"(desc_b),
-                "r"(idesc), "r"(0u), "r"(tmem_sfa), "r"(tmem_sfb));
-    }
-    __syncthreads();
-
-    // 读TMEM前16行 (x1 = 16 DP × 256 bits)
-    if (warp_id == 0) {
-        uint32_t r0, r1, r2, r3;
-        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n\t"
-                     "tcgen05.wait::ld.sync.aligned;\n"
-                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(tmem_c));
-        D_out[lane * 4 + 0] = __uint_as_float(r0);
-        D_out[lane * 4 + 1] = __uint_as_float(r1);
-        D_out[lane * 4 + 2] = __uint_as_float(r2);
-        D_out[lane * 4 + 3] = __uint_as_float(r3);
-    }
-
-    __syncthreads();
-    if (warp_id == 0) {
-        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
-                     : : "r"(tmem_base), "r"(512));
-    }
-}
-
+// (原阶段1全1.0测试已移除: 随机vs CPU为严格超集 — PHASE1_STRIPPED)
 
 // ============================================================
 // 阶段2: 随机数据 + 随机scale vs CPU 参考 (逐bit精确, 自包含)
@@ -327,25 +244,5 @@ inline int random_vs_cpu(uint32_t seed) {
 }  // namespace p2
 
 int main() {
-    float *d_out, h[128];
-    CHECK_CUDA(cudaMalloc(&d_out, 4096));
-
-    printf("====== NVFP4 MAX tile (tcgen05.mma cta_group::2) ======\n");
-    printf("M=%d N=%d K=%d = %d FMA per instruction\n\n", M, N, K, M*N*K);
-
-    CHECK_CUDA(cudaMemset(d_out, 0, 4096));
-    // 需要足够smem: A(8192) + B(8192) + misc = ~20KB
-    tcgen05_nvfp4_max_kernel<<<1, THREADS, 20480>>>(d_out);
-    cudaError_t e = cudaDeviceSynchronize();
-    if (e) { printf("Error: %s\n", cudaGetErrorString(e)); return 1; }
-
-    CHECK_CUDA(cudaMemcpy(h, d_out, 128 * sizeof(float), cudaMemcpyDeviceToHost));
-    int pass = 0;
-    for (int i = 0; i < 128; i++) if (h[i] == 64.0f) pass++;
-    printf("Result: %d/128 correct (=64.0)\n", pass);
-    printf("D[0:8]: %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n",
-           h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-
-    cudaFree(d_out);
     return p2::random_vs_cpu(1);
 }

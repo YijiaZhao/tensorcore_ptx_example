@@ -48,44 +48,7 @@ constexpr int THREADS = 128;                // 1 warpgroup
 constexpr int A_BYTES = M * K * 2;          // 2048, row-major, 行=32B
 constexpr int B_BYTES = K * N * 2;          // 256,  col-major, 列=32B
 
-__global__ void wgmma_fp16_kernel(float* D_out) {
-    extern __shared__ char smem[];
-    uint32_t* smem_a = (uint32_t*)smem;
-    uint32_t* smem_b = (uint32_t*)(smem + A_BYTES);
-
-    int tid = threadIdx.x;
-
-    // A=B=fp16(1.0)=0x3C00
-    for (int i = tid; i < A_BYTES / 4; i += THREADS) smem_a[i] = 0x3C003C00u;
-    for (int i = tid; i < B_BYTES / 4; i += THREADS) smem_b[i] = 0x3C003C00u;
-    __syncthreads();
-    // 普通store对异步代理(wgmma)可见
-    asm volatile("fence.proxy.async.shared::cta;");
-
-    uint64_t desc_a = make_desc_wgmma(smem_a);
-    uint64_t desc_b = make_desc_wgmma(smem_b);
-
-    // 整个warpgroup(128线程)一起发射; p=0 → 不读入D
-    float d0, d1, d2, d3;
-    asm volatile(
-        "{\n\t"
-        ".reg .pred p;\n\t"
-        "setp.ne.b32 p, %6, 0;\n\t"
-        "wgmma.fence.sync.aligned;\n\t"
-        "wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 "
-        "{%0,%1,%2,%3}, %4, %5, p, 1, 1, 0, 0;\n\t"
-        "wgmma.commit_group.sync.aligned;\n\t"
-        "wgmma.wait_group.sync.aligned 0;\n\t"
-        "}\n"
-        : "=f"(d0), "=f"(d1), "=f"(d2), "=f"(d3)
-        : "l"(desc_a), "l"(desc_b), "r"(0u));
-
-    D_out[tid * 4 + 0] = d0;
-    D_out[tid * 4 + 1] = d1;
-    D_out[tid * 4 + 2] = d2;
-    D_out[tid * 4 + 3] = d3;
-}
-
+// (原阶段1全1.0测试已移除: 随机vs CPU为严格超集 — PHASE1_STRIPPED)
 
 // ============================================================
 // 阶段2: 随机数据 vs CPU 参考 (逐bit精确)
@@ -159,26 +122,5 @@ static int phase2_random_vs_cpu(uint32_t seed) {
 }
 
 int main() {
-    float *d_out, h[512];
-    CHECK_CUDA(cudaMalloc(&d_out, 512 * sizeof(float)));
-    CHECK_CUDA(cudaMemset(d_out, 0, 512 * sizeof(float)));
-
-    printf("====== FP16 (wgmma.mma_async, sm_90a) ======\n");
-    printf("A[64x16]=1.0 (smem desc), B[16x8]=1.0 (smem desc)\n");
-    printf("M=%d N=%d K=%d, warpgroup=128线程, expect D=16.0\n\n", M, N, K);
-
-    wgmma_fp16_kernel<<<1, THREADS, 8192>>>(d_out);
-    cudaError_t e = cudaDeviceSynchronize();
-    if (e) { printf("Error: %s\n", cudaGetErrorString(e)); }
-    else {
-        CHECK_CUDA(cudaMemcpy(h, d_out, 512 * sizeof(float), cudaMemcpyDeviceToHost));
-        int pass = 0;
-        for (int i = 0; i < 512; i++) if (h[i] == 16.0f) pass++;
-        printf("Result: %d/512 correct (=16.0)\n", pass);
-        printf("D[0:8]: %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n",
-               h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
-    }
-
-    cudaFree(d_out);
     return phase2_random_vs_cpu(1);
 }
