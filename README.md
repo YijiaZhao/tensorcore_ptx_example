@@ -167,7 +167,8 @@ nvcr.io/nvidia/cuda:13.0.0-devel-ubuntu22.04
 ```bash
 # 例: 在 B200 上跑一个 tcgen05 例子
 nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 -o /tmp/t tcgen05_fp8.cu && /tmp/t
-# 输出: Result: 128/128 correct (=32.0)  ← 全对即硬件行为符合预期
+# 输出: random r0/r1/r2 PASS (128/128 exact) → 全部PASS  ← 随机数据与CPU参考逐bit相等
+#       (tcgen05 类会先打印 "D布局探针: ... 槽位一致有效")
 
 # 批量跑一个目录 (架构对应换 -gencode):
 for f in */*.cu; do b=$(basename $f .cu)
