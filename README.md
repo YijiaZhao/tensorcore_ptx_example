@@ -203,15 +203,9 @@ docker run --rm --gpus all -v <本仓库路径>:/work \
   看到的 A_eff 读出来再验 MMA，绕开未知的 st 布局
 - 退出码 0=全过，可直接接 CI
 
-`random_cpu_ref/` 提供公共件与独立版验证器：
-
-- **`verify_random.h`**（可复用）：各格式编码表、确定性随机、CPU 参考 GEMM、精确比对。
-  取值集刻意限制在 {0, ±0.5, ±1, ±1.5, ±2} —— 任意乘加顺序在 fp32 里精确，
-  所以 CPU float 和 tensor core 结果可以逐 bit `==` 比对，无容差。
-- **`mma_random_cpu_ref_all_arch.cu`**：六精度 mma.sync，fragment 映射按 PTX 布局装载，四架构通用
-- **`wgmma_random_cpu_ref_sm90.cu`**：五精度 wgmma，smem 按 core-matrix 布局排
-- **`tcgen05_random_cpu_ref_sm100.cu`**：五精度 tcgen05，D 读回布局用 one-hot 探针实测（不做假设），
-  一致性探针自动过滤 TMEM 跨 kernel 残留槽位
+公共件只有一个：**`random_cpu_ref/verify_random.h`**（所有 .cu 共用）——各格式编码表
+（{0,±0.5,±1,±1.5,±2}，保证任意累加顺序 fp32 零舍入 → 可用 `==`）、scale 编码表、
+确定性随机、mma fragment 下标、CPU 参考 GEMM（含 block-scale 版）、精确比对。
 
 跑法（-gencode 按第 5 节开头的架构表换）：
 
