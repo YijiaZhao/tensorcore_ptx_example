@@ -43,21 +43,19 @@
 // (原阶段1全1.0测试已移除: 随机vs CPU为严格超集 — PHASE1_STRIPPED)
 
 // ============================================================
-// 阶段2: 随机数据 + 随机scale vs CPU 参考 (逐bit精确)
-//   数据每元素独立随机, scale 每K段独立随机(对所有行广播, 与硬件语义一致),
-//   CPU 参考: D = Σ_seg sfa[seg]*sfb[seg]*Σ_{k∈seg} a*b — scale 数学被完整验证。
+// 验证: 随机数据 vs CPU 参考 (逐bit精确) — host驱动统一在 verify_random.h::vr_verify()
+//   本文件只保留: 被测kernel + launch适配器
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
 
-__global__ void phase2_random_kernel(const uint32_t* A, const uint32_t* B, float* D,
-                                     uint32_t sfa, uint32_t sfb) {
+__global__ void vk(const uint32_t* A, const uint32_t* B, float* D,
+                   uint32_t sfa, uint32_t sfb) {
     int lane = threadIdx.x % 32;
     uint32_t a0=A[mma_a_idx(lane,0)], a1=A[mma_a_idx(lane,1)],
              a2=A[mma_a_idx(lane,2)], a3=A[mma_a_idx(lane,3)];
     uint32_t b0=B[mma_b_idx(lane,0)], b1=B[mma_b_idx(lane,1)];
-    float d0, d1, d2, d3;
-    asm volatile(
-        "mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
+    float d0,d1,d2,d3;
+    asm volatile("mma.sync.aligned.kind::mxf8f6f4.block_scale.scale_vec::1X.m16n8k32.row.col.f32.e4m3.e4m3.f32.ue8m0 "
         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
         "{%14},{%15,%16},{%17},{%18,%19};\n"
         : "=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3)
@@ -69,41 +67,22 @@ __global__ void phase2_random_kernel(const uint32_t* A, const uint32_t* B, float
     D[mma_d_idx(lane,2)]=d2; D[mma_d_idx(lane,3)]=d3;
 }
 
-static int phase2_random_vs_cpu(uint32_t seed) {
-    const int M = 16, N = 8, K = 32, EBITS = 8, NSEG = 1, ROUNDS = 3;
-    static uint8_t hA[16*32], hB[8*32];
-    static float refA[16*64], refB[8*64], refD[128], hD[128];
-    uint8_t *dA, *dB; float* dD;
-    CHECK_CUDA(cudaMalloc(&dA, sizeof(hA)));
-    CHECK_CUDA(cudaMalloc(&dB, sizeof(hB)));
-    CHECK_CUDA(cudaMalloc(&dD, sizeof(hD)));
-    printf("\n====== 阶段2: 随机数据+随机scale vs CPU参考 (seed=%u) ======\n", seed);
-    int bad = 0;
-    for (int r = 0; r < ROUNDS; r++) {
-        float sfaf[8], sfbf[8]; uint32_t sfa = 0, sfb = 0;
-        for (int g = 0; g < NSEG; g++) {
-            const EncVal& ea = UE8M0_SET[xorshift(&seed) % SETN(UE8M0_SET)];
-            const EncVal& eb = UE8M0_SET[xorshift(&seed) % SETN(UE8M0_SET)];
-            sfa |= (ea.enc & 0xFF) << (8*g); sfaf[g] = ea.val;
-            sfb |= (eb.enc & 0xFF) << (8*g); sfbf[g] = eb.val;
-        }
-        memset(hA, 0, sizeof(hA)); memset(hB, 0, sizeof(hB));
-        fill_random(hA, refA, M, K, E4M3_SET, SETN(E4M3_SET), EBITS, &seed);
-        fill_random(hB, refB, N, K, E4M3_SET, SETN(E4M3_SET), EBITS, &seed);
-        cpu_gemm_ref_bs(refA, refB, refD, M, N, K, sfaf, sfbf, NSEG);
-        CHECK_CUDA(cudaMemcpy(dA, hA, sizeof(hA), cudaMemcpyHostToDevice));
-        CHECK_CUDA(cudaMemcpy(dB, hB, sizeof(hB), cudaMemcpyHostToDevice));
-        phase2_random_kernel<<<1, 32>>>((uint32_t*)dA, (uint32_t*)dB, dD, sfa, sfb);
-        CHECK_CUDA(cudaDeviceSynchronize());
-        CHECK_CUDA(cudaMemcpy(hD, dD, sizeof(hD), cudaMemcpyDeviceToHost));
-        char tag[16]; snprintf(tag, sizeof(tag), "random r%d", r);
-        bad += check_exact(hD, refD, 128, tag);
-    }
-    cudaFree(dA); cudaFree(dB); cudaFree(dD);
-    printf("====== 阶段2 %s ======\n", bad ? "FAIL" : "全部PASS");
-    return bad ? 1 : 0;
+static void vr_run(const uint8_t* hA, const uint8_t* hB,
+                   const uint32_t* sfa, const uint32_t* sfb, void* out) {
+    static uint8_t *dA, *dB; static float* dD;
+    if (!dA) { cudaMalloc(&dA, 512); cudaMalloc(&dB, 256); cudaMalloc(&dD, 512); }
+    uint32_t pa = 0, pb = 0;                    // 每段1字节, 低段在低字节
+    for (int g = 0; g < 1; g++) { pa |= (sfa[g] & 0xFF) << (8*g); pb |= (sfb[g] & 0xFF) << (8*g); }
+    cudaMemcpy(dA, hA, 512, cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, hB, 256, cudaMemcpyHostToDevice);
+    vk<<<1, 32>>>((uint32_t*)dA, (uint32_t*)dB, dD, pa, pb);
+    cudaDeviceSynchronize();
+    cudaMemcpy(out, dD, 512, cudaMemcpyDeviceToHost);
 }
 
 int main() {
-    return phase2_random_vs_cpu(1);
+    VrSpec sp = {}; sp.M = 16; sp.N = 8; sp.K = 32; sp.ebits = 8;
+    sp.dset = E4M3_SET; sp.dsetn = SETN(E4M3_SET);
+    sp.sset = UE8M0_SET; sp.ssetn = SETN(UE8M0_SET); sp.nseg = 1; sp.sf_one = 0x7F;
+    return vr_verify(sp, vr_run, 1);
 }

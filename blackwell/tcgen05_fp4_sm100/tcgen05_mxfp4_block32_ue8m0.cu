@@ -68,23 +68,12 @@ constexpr int B_BYTES = N * K / 2;  // 256
 // (原阶段1全1.0测试已移除: 随机vs CPU为严格超集 — PHASE1_STRIPPED)
 
 // ============================================================
-// 阶段2: 随机数据 + 随机scale vs CPU 参考 (逐bit精确)
-//   数据每元素独立随机(e2m1可精确编码集); scale 每轮随机、各K段取同值
-//   (段间独立随机需先摸清TMEM内sf字节→K段映射, 此处不假设; 段一致时CPU参考不受影响)
-//   D 布局用 base-4 探针实测 + 一致性过滤(见 tcgen05 常规精度文件, 同一框架)。
+// 验证: 随机数据 vs CPU 参考 (逐bit精确) — host驱动统一在 verify_random.h::vr_verify()
+//   本文件只保留: 被测kernel + launch适配器
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
 
-static const int EBITS = 4;
-static uint32_t phase2_enc_small(int v) {   // e2m1: {0,1,2,3,4,6}
-    static const int      vals[] = {0, 1, 2, 3, 4, 6};
-    static const uint32_t encs[] = {0x0, 0x2, 0x4, 0x5, 0x6, 0x7};
-    for (int i = 0; i < 6; i++) if (vals[i] == v) return encs[i];
-    return 0;
-}
-
-__global__ void phase2_random_kernel(const uint8_t* A, const uint8_t* B, uint32_t* D_raw,
-                                     uint32_t sfa_splat, uint32_t sfb_splat) {
+__global__ void vk(const uint8_t* A, const uint8_t* B, uint32_t* D_raw, uint32_t sfa_b, uint32_t sfb_b) {
     extern __shared__ char smem[];
     uint32_t* sA = (uint32_t*)smem;
     uint32_t* sB = (uint32_t*)(smem + A_BYTES);
@@ -100,20 +89,20 @@ __global__ void phase2_random_kernel(const uint8_t* A, const uint8_t* B, uint32_
     uint32_t tmem_c = *s_tmem;
     uint32_t tmem_sfa = tmem_c + 8, tmem_sfb = tmem_c + 12;
     if (warp_id == 0) {
+        uint32_t va = (sfa_b & 0xFF) * 0x01010101u, vb = (sfb_b & 0xFF) * 0x01010101u;
         asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};"
-                     : : "r"(tmem_sfa), "r"(sfa_splat), "r"(sfa_splat), "r"(sfa_splat), "r"(sfa_splat));
+                     : : "r"(tmem_sfa), "r"(va), "r"(va), "r"(va), "r"(va));
         asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};"
-                     : : "r"(tmem_sfb), "r"(sfb_splat), "r"(sfb_splat), "r"(sfb_splat), "r"(sfb_splat));
+                     : : "r"(tmem_sfb), "r"(vb), "r"(vb), "r"(vb), "r"(vb));
+        asm volatile("tcgen05.wait::st.sync.aligned;");
     }
     __syncthreads();
     uint64_t da = make_desc(sA, 32), db = make_desc(sB, 32);
-    uint32_t idesc = make_idesc(tmem_sfa, tmem_sfb);
     __syncthreads();
     if (tid == 0) {
         asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
             "tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X [%0], %1, %2, %3, [%5], [%6], p;\n\t}\n"
-            : : "r"(tmem_c), "l"(da), "l"(db), "r"(idesc), "r"(0u),
-                "r"(tmem_sfa), "r"(tmem_sfb));
+            : : "r"(tmem_c), "l"(da), "l"(db), "r"((uint32_t)((1<<7)|(1<<10)|(1<<17)|(1<<23)|(8<<24)|(((tmem_c+8)>>30&3)<<29)|(((tmem_c+12)>>30&3)<<4))), "r"(0u), "r"(tmem_sfa), "r"(tmem_sfb));
     }
     __syncthreads();
     if (warp_id == 0) {
@@ -129,90 +118,21 @@ __global__ void phase2_random_kernel(const uint8_t* A, const uint8_t* B, uint32_
                      : : "r"(tmem_c), "r"(32));
 }
 
-static void phase2_to_core_matrix(uint8_t* buf, int rows) {
-    static uint8_t tmp[128 * 32];
-    memcpy(tmp, buf, rows * 32);
-    for (int m = 0; m < rows; m++)
-        for (int kb = 0; kb < 32; kb++)
-            buf[(m/8)*256 + (kb/16)*128 + (m%8)*16 + kb%16] = tmp[m*32 + kb];
-}
-static float phase2_u32f(uint32_t u) { float f; memcpy(&f, &u, 4); return f; }
-
-static uint8_t p2_hA[A_BYTES], p2_hB[B_BYTES];
-static uint32_t p2_hD[128];
-static void phase2_run(uint8_t* dA, uint8_t* dB, uint32_t* dD, uint32_t sfa, uint32_t sfb) {
-    phase2_to_core_matrix(p2_hA, M); phase2_to_core_matrix(p2_hB, N);
-    CHECK_CUDA(cudaMemcpy(dA, p2_hA, A_BYTES, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemcpy(dB, p2_hB, B_BYTES, cudaMemcpyHostToDevice));
-    CHECK_CUDA(cudaMemset(dD, 0, 512));
-    phase2_random_kernel<<<1, THREADS, A_BYTES + B_BYTES + 128>>>(dA, dB, dD, sfa, sfb);
-    CHECK_CUDA(cudaDeviceSynchronize());
-    CHECK_CUDA(cudaMemcpy(p2_hD, dD, 512, cudaMemcpyDeviceToHost));
-}
-static void phase2_probe(uint8_t* dA, uint8_t* dB, uint32_t* dD,
-                         int adigit, int bdigit, int dbl, int* out) {
-    memset(p2_hA, 0, A_BYTES); memset(p2_hB, 0, B_BYTES);
-    for (int m = 0; m < M; m++) {
-        int v = adigit < 0 ? 1 : ((m >> (2*adigit)) & 3) * (dbl ? 2 : 1);
-        pack_set(p2_hA, m * K, phase2_enc_small(v), EBITS);
-    }
-    for (int n = 0; n < N; n++) {
-        int v = bdigit < 0 ? 1 : ((n >> (2*bdigit)) & 3);
-        pack_set(p2_hB, n * K, phase2_enc_small(v), EBITS);
-    }
-    phase2_run(dA, dB, dD, 0x7Fu * 0x01010101u, 0x7Fu * 0x01010101u);
-    for (int s = 0; s < 128; s++) out[s] = (int)phase2_u32f(p2_hD[s]);
-}
-
-static int phase2_random_vs_cpu(uint32_t seed) {
-    const int ROUNDS = 3;
-    static float refA[128*64], refB[8*64], refD[128*8];
-    uint8_t *dA, *dB; uint32_t* dD;
-    CHECK_CUDA(cudaMalloc(&dA, A_BYTES)); CHECK_CUDA(cudaMalloc(&dB, B_BYTES));
-    CHECK_CUDA(cudaMalloc(&dD, 512));
-    printf("\n====== 阶段2: 随机数据+随机scale vs CPU参考 (seed=%u) ======\n", seed);
-    static int pr[4][128], pc[2][128], pchk[128], mrow[128], mcol[128];
-    static bool valid[128];
-    for (int d = 0; d < 4; d++) phase2_probe(dA, dB, dD, d, -1, 0, pr[d]);
-    for (int d = 0; d < 2; d++) phase2_probe(dA, dB, dD, -1, d, 0, pc[d]);
-    phase2_probe(dA, dB, dD, 0, -1, 1, pchk);
-    int nvalid = 0; static bool seen[128][8]; memset(seen, 0, sizeof(seen));
-    for (int s = 0; s < 128; s++) {
-        int row = pr[0][s] + 4*pr[1][s] + 16*pr[2][s] + 64*pr[3][s];
-        int col = pc[0][s] + 4*pc[1][s];
-        bool ok = true;
-        for (int d = 0; d < 4; d++) if (pr[d][s] < 0 || pr[d][s] > 3) ok = false;
-        for (int d = 0; d < 2; d++) if (pc[d][s] < 0 || pc[d][s] > 3) ok = false;
-        ok = ok && row < M && col < N && pchk[s] == 2*pr[0][s] && !seen[row][col%8];
-        valid[s] = ok; mrow[s] = row; mcol[s] = col;
-        if (ok) { seen[row][col%8] = true; nvalid++; }
-    }
-    printf("D布局探针: %d/128 槽位一致有效\n", nvalid);
-    if (nvalid < 32) { printf("====== 阶段2 FAIL (探针不足) ======\n"); return 1; }
-    int bad = 0;
-    for (int r = 0; r < ROUNDS; r++) {
-        const EncVal& ea = UE8M0_SET[xorshift(&seed) % SETN(UE8M0_SET)];
-        const EncVal& eb = UE8M0_SET[xorshift(&seed) % SETN(UE8M0_SET)];
-        float sfaf = ea.val, sfbf = eb.val;
-        memset(p2_hA, 0, A_BYTES); memset(p2_hB, 0, B_BYTES);
-        fill_random(p2_hA, refA, M, K, E2M1_SET, SETN(E2M1_SET), EBITS, &seed);
-        fill_random(p2_hB, refB, N, K, E2M1_SET, SETN(E2M1_SET), EBITS, &seed);
-        cpu_gemm_ref_bs(refA, refB, refD, M, N, K, &sfaf, &sfbf, 1);
-        phase2_run(dA, dB, dD, ea.enc * 0x01010101u, eb.enc * 0x01010101u);
-        float got[128], want[128]; int nv = 0;
-        for (int s = 0; s < 128; s++) {
-            if (!valid[s]) continue;
-            got[nv]  = phase2_u32f(p2_hD[s]);
-            want[nv] = refD[mrow[s] * N + mcol[s]]; nv++;
-        }
-        char tag[16]; snprintf(tag, sizeof(tag), "random r%d", r);
-        bad += check_exact(got, want, nv, tag);
-    }
-    cudaFree(dA); cudaFree(dB); cudaFree(dD);
-    printf("====== 阶段2 %s ======\n", bad ? "FAIL" : "全部PASS");
-    return bad ? 1 : 0;
+static void vr_run(const uint8_t* hA, const uint8_t* hB,
+                   const uint32_t* sfa, const uint32_t* sfb, void* out) {
+    static uint8_t *dA, *dB; static uint32_t* dD;
+    if (!dA) { cudaMalloc(&dA, A_BYTES); cudaMalloc(&dB, B_BYTES); cudaMalloc(&dD, 512); }
+    cudaMemcpy(dA, hA, A_BYTES, cudaMemcpyHostToDevice);
+    cudaMemcpy(dB, hB, B_BYTES, cudaMemcpyHostToDevice);
+    vk<<<1, THREADS, A_BYTES + B_BYTES + 128>>>(dA, dB, dD, sfa[0], sfb[0]);
+    cudaDeviceSynchronize();
+    cudaMemcpy(out, dD, 512, cudaMemcpyDeviceToHost);
 }
 
 int main() {
-    return phase2_random_vs_cpu(1);
+    VrSpec sp = {}; sp.M = 128; sp.N = 8; sp.K = K; sp.ebits = 4; sp.is_int = 0;
+    sp.dset = E2M1_SET; sp.dsetn = SETN(E2M1_SET); sp.core_matrix = 1;
+    sp.probe = 1; sp.nslot = 128; sp.enc_tab = VR_ENC_E2M1; sp.sf_one = 0x7F;
+    sp.sset = UE8M0_SET; sp.ssetn = SETN(UE8M0_SET); sp.nseg = 1;
+    return vr_verify(sp, vr_run, 1);
 }
