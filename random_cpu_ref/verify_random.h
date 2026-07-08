@@ -108,3 +108,43 @@ static inline int check_exact(const float* got, const float* want, int n, const 
     printf("  %-10s %s (%d/%d exact)\n", tag, bad ? "FAIL" : "PASS", n - bad, n);
     return bad;
 }
+
+// ============================================================
+// 供各示例 .cu 内嵌「阶段2: 随机 vs CPU」使用的公共件
+// ============================================================
+
+// ---- mma.sync m16n8kX fragment 下标 (PTX row.col 布局, 行恒32B=8×u32, 全形状统一) ----
+#ifdef __CUDACC__
+__device__ __forceinline__ int mma_a_idx(int lane, int r) {   // A[16][8] 的 u32 下标
+    return (lane / 4 + (r & 1) * 8) * 8 + lane % 4 + (r >> 1) * 4;
+}
+__device__ __forceinline__ int mma_b_idx(int lane, int r) {   // B[8][8] 的 u32 下标
+    return (lane / 4) * 8 + lane % 4 + r * 4;
+}
+__device__ __forceinline__ int mma_d_idx(int lane, int r) {   // D[16][8] 的 float 下标
+    return (lane / 4 + (r >> 1) * 8) * 8 + (lane % 4) * 2 + (r & 1);
+}
+#endif
+
+// ---- block scale 的 scale 编码表 (取值同样保证精确: 2的幂 + 1.5) ----
+static const EncVal UE8M0_SET[] = {{0x7E,0.5f},{0x7F,1.f},{0x80,2.f}};
+static const EncVal UE4M3_SET[] = {{0x30,0.5f},{0x38,1.f},{0x3C,1.5f},{0x40,2.f}};
+
+// CPU 参考(带 per-K-segment scale, scale 对所有行广播):
+//   D[m][n] = Σ_seg sfa[seg]*sfb[seg] * Σ_{k∈seg} A[m][k]*B[n][k]
+static inline void cpu_gemm_ref_bs(const float* A, const float* B, float* D,
+                                   int M, int N, int K,
+                                   const float* sfa, const float* sfb, int nseg) {
+    int segK = K / nseg;
+    for (int m = 0; m < M; m++)
+        for (int n = 0; n < N; n++) {
+            float acc = 0.f;
+            for (int seg = 0; seg < nseg; seg++) {
+                float s = 0.f;
+                for (int k = seg * segK; k < (seg + 1) * segK; k++)
+                    s += A[m * K + k] * B[n * K + k];
+                acc += sfa[seg] * sfb[seg] * s;
+            }
+            D[m * N + n] = acc;
+        }
+}

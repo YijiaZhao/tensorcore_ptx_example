@@ -86,6 +86,78 @@ __global__ void wgmma_fp8_kernel(float* D_out) {
     D_out[tid * 4 + 3] = d3;
 }
 
+
+// ============================================================
+// 阶段2: 随机数据 vs CPU 参考 (逐bit精确)
+//   smem 按 8行×16B core-matrix 排布(host侧重排), D 按 warpgroup fragment 映射还原,
+//   CPU 三重循环参考, 逐元素 == —— descriptor/布局错误这里全兜住 (全1.0查不出)。
+// ============================================================
+#include "../../random_cpu_ref/verify_random.h"
+
+__device__ __forceinline__ int phase2_d_pos(int tid, int r) {   // → D[64][8] 线性下标
+    int lane = tid % 32, w = tid / 32;
+    return (16 * w + lane / 4 + (r >> 1) * 8) * 8 + (lane % 4) * 2 + (r & 1);
+}
+
+__global__ void phase2_random_kernel(const uint8_t* A, const uint8_t* B, float* D) {
+    extern __shared__ char smem[];
+    uint32_t* sA = (uint32_t*)smem; uint32_t* sB = (uint32_t*)(smem + A_BYTES);
+    int tid = threadIdx.x;
+    for (int i = tid; i < A_BYTES / 4; i += THREADS) sA[i] = ((uint32_t*)A)[i];
+    for (int i = tid; i < B_BYTES / 4; i += THREADS) sB[i] = ((uint32_t*)B)[i];
+    __syncthreads();
+    asm volatile("fence.proxy.async.shared::cta;");
+    uint64_t da = make_desc_wgmma(sA), db = make_desc_wgmma(sB);
+    float d0, d1, d2, d3;
+    asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %6, 0;\n\t"
+        "wgmma.fence.sync.aligned;\n\t"
+        "wgmma.mma_async.sync.aligned.m64n8k32.f32.e4m3.e4m3 {%0,%1,%2,%3}, %4, %5, p, 1, 1;\n\t"
+        "wgmma.commit_group.sync.aligned;\n\t"
+        "wgmma.wait_group.sync.aligned 0;\n\t}\n"
+        : "=f"(d0),"=f"(d1),"=f"(d2),"=f"(d3)
+        : "l"(da), "l"(db), "r"(0u));
+    D[phase2_d_pos(tid,0)]=d0; D[phase2_d_pos(tid,1)]=d1;
+    D[phase2_d_pos(tid,2)]=d2; D[phase2_d_pos(tid,3)]=d3;
+}
+
+// GMMA no-swizzle: (m,kb) → (m/8)*256 + (kb/16)*128 + (m%8)*16 + kb%16
+static void phase2_to_core_matrix(uint8_t* buf, int rows) {
+    static uint8_t tmp[64 * 32];
+    memcpy(tmp, buf, rows * 32);
+    for (int m = 0; m < rows; m++)
+        for (int kb = 0; kb < 32; kb++)
+            buf[(m/8)*256 + (kb/16)*128 + (m%8)*16 + kb%16] = tmp[m*32 + kb];
+}
+
+static int phase2_random_vs_cpu(uint32_t seed) {
+    const int K = 32, EBITS = 8, ROUNDS = 3;
+    static uint8_t hA[A_BYTES], hB[B_BYTES];
+    static float refA[64*64], refB[8*64], refD[64*8], hD[64*8];
+    uint8_t *dA, *dB; float* dD;
+    CHECK_CUDA(cudaMalloc(&dA, A_BYTES));
+    CHECK_CUDA(cudaMalloc(&dB, B_BYTES));
+    CHECK_CUDA(cudaMalloc(&dD, sizeof(hD)));
+    printf("\n====== 阶段2: 随机数据 vs CPU参考 (seed=%u) ======\n", seed);
+    int bad = 0;
+    for (int r = 0; r < ROUNDS; r++) {
+        memset(hA, 0, sizeof(hA)); memset(hB, 0, sizeof(hB));
+        fill_random(hA, refA, M, K, E4M3_SET, SETN(E4M3_SET), EBITS, &seed);
+        fill_random(hB, refB, N, K, E4M3_SET, SETN(E4M3_SET), EBITS, &seed);
+        cpu_gemm_ref(refA, refB, refD, M, N, K);
+        phase2_to_core_matrix(hA, M); phase2_to_core_matrix(hB, N);
+        CHECK_CUDA(cudaMemcpy(dA, hA, A_BYTES, cudaMemcpyHostToDevice));
+        CHECK_CUDA(cudaMemcpy(dB, hB, B_BYTES, cudaMemcpyHostToDevice));
+        phase2_random_kernel<<<1, THREADS, A_BYTES + B_BYTES + 128>>>(dA, dB, dD);
+        CHECK_CUDA(cudaDeviceSynchronize());
+        CHECK_CUDA(cudaMemcpy(hD, dD, sizeof(hD), cudaMemcpyDeviceToHost));
+        char tag[16]; snprintf(tag, sizeof(tag), "random r%d", r);
+        bad += check_exact(hD, refD, 64*8, tag);
+    }
+    cudaFree(dA); cudaFree(dB); cudaFree(dD);
+    printf("====== 阶段2 %s ======\n", bad ? "FAIL" : "全部PASS");
+    return bad ? 1 : 0;
+}
+
 int main() {
     float *d_out, h[512];
     CHECK_CUDA(cudaMalloc(&d_out, 512 * sizeof(float)));
@@ -108,5 +180,5 @@ int main() {
     }
 
     cudaFree(d_out);
-    return 0;
+    return phase2_random_vs_cpu(1);
 }
