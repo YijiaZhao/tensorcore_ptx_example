@@ -18,7 +18,7 @@
  *   7. tcgen05.dealloc → 释放TMEM
  *
  * 编译: nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 \
- *            -o tcgen05_nvfp4 tcgen05_nvfp4.cu
+ *            -o tcgen05_nvfp4_block16_ue4m3_ss_and_ts tcgen05_nvfp4_block16_ue4m3_ss_and_ts.cu
  */
 
 #include <cuda_runtime.h>

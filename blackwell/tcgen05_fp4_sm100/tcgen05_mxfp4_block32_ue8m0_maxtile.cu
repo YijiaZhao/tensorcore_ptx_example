@@ -1,17 +1,13 @@
 /**
- * tcgen05.mma 最大tile — NVFP4 block16 (sm_100)
+ * tcgen05.mma 最大tile — MXFP4 block32 (sm_100)
  *
  * cta_group::1 (4 warps = 128 threads), M=128, N=256, K=64
  * 单条指令: 128 × 256 × 64 = 2,097,152 FMA (~2M FMA)
  *
- * 指令: tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X
- *
- * A[128×64] FP4 = 4096 bytes
- * B[256×64] FP4 = 8192 bytes (col-major, K-major)
- * D[128×256] f32 在TMEM
+ * 指令: tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X
  *
  * 编译: nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 \
- *            -o tcgen05_nvfp4_max tcgen05_nvfp4_max.cu
+ *            -o tcgen05_mxfp4_block32_ue8m0_maxtile tcgen05_mxfp4_block32_ue8m0_maxtile.cu
  */
 
 #include <cuda_runtime.h>
@@ -35,13 +31,13 @@ __device__ uint64_t make_desc(void const* smem_ptr, int stride_bytes) {
     return desc;
 }
 
-// cta_group::1 最大: M=128, N=256
+// MXFP4: scale_format=1 (UE8M0)
 __device__ uint32_t make_idesc(uint32_t tsfa, uint32_t tsfb) {
     uint32_t d = 0;
     d |= (1 << 7);                    // a_format = E2M1
     d |= (1 << 10);                   // b_format = E2M1
     d |= (32 << 17);                  // n_dim = N/8 = 32 (N=256)
-    // scale_format = 0 (UE4M3)
+    d |= (1 << 23);                   // scale_format = UE8M0
     d |= (8 << 24);                   // m_dim = M/16 = 8 (M=128)
     d |= ((tsfa >> 30) & 3) << 29;
     d |= ((tsfb >> 30) & 3) << 4;
@@ -49,11 +45,11 @@ __device__ uint32_t make_idesc(uint32_t tsfa, uint32_t tsfb) {
 }
 
 constexpr int M = 128, N = 256, K = 64;
-constexpr int THREADS = 128;  // cta_group::1 = 4 warps
+constexpr int THREADS = 128;
 constexpr int A_BYTES = M * K / 2;  // 4096
 constexpr int B_BYTES = N * K / 2;  // 8192
 
-__global__ void tcgen05_nvfp4_max_kernel(float* D_out) {
+__global__ void tcgen05_mxfp4_max_kernel(float* D_out) {
     extern __shared__ char smem[];
     uint8_t*  smem_a    = (uint8_t*)smem;
     uint8_t*  smem_b    = smem_a + A_BYTES;
@@ -65,9 +61,6 @@ __global__ void tcgen05_nvfp4_max_kernel(float* D_out) {
     for (int i = tid; i < B_BYTES; i += THREADS) smem_b[i] = 0x22;
     __syncthreads();
 
-    // TMEM alloc — cta_group::2 用更多列
-    // D[256×256] f32 需要256列, scale也需要列
-    // TMEM max = 512列
     if (warp_id == 0) {
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
                      : : "r"(smem_u32(smem_tmem)), "r"(512));
@@ -76,11 +69,11 @@ __global__ void tcgen05_nvfp4_max_kernel(float* D_out) {
 
     uint32_t tmem_base = *smem_tmem;
     uint32_t tmem_c    = tmem_base;
-    uint32_t tmem_sfa  = tmem_base + 256;  // after D's 256 columns
+    uint32_t tmem_sfa  = tmem_base + 256;
     uint32_t tmem_sfb  = tmem_base + 300;
 
-    // 写scale: ue4m3(1.0) = 0x38
-    uint32_t sf_val = 0x38383838u;
+    // scale: ue8m0(1.0) = 0x7F
+    uint32_t sf_val = 0x7F7F7F7Fu;
     if (warp_id == 0) {
         asm volatile("tcgen05.st.sync.aligned.16x256b.x1.b32 [%0], {%1,%2,%3,%4};\n"
                      : : "r"(tmem_sfa), "r"(sf_val), "r"(sf_val), "r"(sf_val), "r"(sf_val));
@@ -97,20 +90,17 @@ __global__ void tcgen05_nvfp4_max_kernel(float* D_out) {
     uint32_t idesc  = make_idesc(tmem_sfa, tmem_sfb);
 
     if (tid == 0) {
-        printf("NVFP4 MAX: M=%d N=%d K=%d, cta_group::2 (8 warps)\n", M, N, K);
+        printf("MXFP4 MAX: M=%d N=%d K=%d, cta_group::1 (8 warps)\n", M, N, K);
         printf("FMA per instruction: %d\n", M * N * K);
-        printf("tmem: c=0x%x sfa=0x%x sfb=0x%x\n", tmem_c, tmem_sfa, tmem_sfb);
-        printf("idesc=0x%08x\n", idesc);
     }
     __syncthreads();
 
-    // tcgen05.mma cta_group::2
     if (tid == 0) {
         asm volatile(
             "{\n\t"
             ".reg .pred p;\n\t"
             "setp.ne.b32 p, %4, 0;\n\t"
-            "tcgen05.mma.cta_group::1.kind::mxf4nvf4.block_scale.scale_vec::4X "
+            "tcgen05.mma.cta_group::1.kind::mxf4.block_scale.scale_vec::2X "
             "[%0], %1, %2, %3, [%5], [%6], p;\n\t"
             "}\n"
             : : "r"(tmem_c), "l"(desc_a), "l"(desc_b),
@@ -118,7 +108,6 @@ __global__ void tcgen05_nvfp4_max_kernel(float* D_out) {
     }
     __syncthreads();
 
-    // 读TMEM前16行 (x1 = 16 DP × 256 bits)
     if (warp_id == 0) {
         uint32_t r0, r1, r2, r3;
         asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n"
@@ -140,12 +129,11 @@ int main() {
     float *d_out, h[128];
     CHECK_CUDA(cudaMalloc(&d_out, 4096));
 
-    printf("====== NVFP4 MAX tile (tcgen05.mma cta_group::2) ======\n");
+    printf("====== MXFP4 MAX tile (tcgen05.mma cta_group::1) ======\n");
     printf("M=%d N=%d K=%d = %d FMA per instruction\n\n", M, N, K, M*N*K);
 
     CHECK_CUDA(cudaMemset(d_out, 0, 4096));
-    // 需要足够smem: A(8192) + B(8192) + misc = ~20KB
-    tcgen05_nvfp4_max_kernel<<<1, THREADS, 20480>>>(d_out);
+    tcgen05_mxfp4_max_kernel<<<1, THREADS, 20480>>>(d_out);
     cudaError_t e = cudaDeviceSynchronize();
     if (e) { printf("Error: %s\n", cudaGetErrorString(e)); return 1; }
 

@@ -1,9 +1,9 @@
 // Build:
-//   nvcc -std=c++17 check_multimem.cu -lcuda -o check_multimem
+//   nvcc -std=c++17 check_multimem_nvlink_multicast.cu -lcuda -o check_multimem_nvlink_multicast
 //
 // Run:
-//   ./check_multimem           # check all visible CUDA devices as one team
-//   ./check_multimem 0 1 2 3   # check an explicit multicast team
+//   ./check_multimem_nvlink_multicast           # check all visible CUDA devices as one team
+//   ./check_multimem_nvlink_multicast 0 1 2 3   # check an explicit multicast team
 
 #include <cuda.h>
 

@@ -39,7 +39,7 @@
  *     byte[3] = K[48:63]  的 scale
  *   sf_B: 同上
  *
- * Compile: nvcc -gencode arch=compute_120a,code=sm_120a -o mma_nvfp4_4x mma_nvfp4_4x.cu
+ * Compile: nvcc -gencode arch=compute_120a,code=sm_120a -o mma_nvfp4_block16_ue4m3 mma_nvfp4_block16_ue4m3.cu
  */
 
 #include <cuda_runtime.h>

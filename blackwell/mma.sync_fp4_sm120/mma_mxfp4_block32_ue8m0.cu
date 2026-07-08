@@ -47,7 +47,7 @@
  *   sf_B: 同上
  *   {byte-id, thread-id}: 指定从warp中哪个线程的哪个byte读取scale
  *
- * Compile: nvcc -gencode arch=compute_120a,code=sm_120a -o mma_nvfp4 mma_mxfp4.cu
+ * Compile: nvcc -gencode arch=compute_120a,code=sm_120a -o mma_nvfp4 mma_mxfp4_block32_ue8m0.cu
  */
 
 #include <cuda_runtime.h>

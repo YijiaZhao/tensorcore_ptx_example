@@ -1,5 +1,5 @@
 /**
- * 最小 INT4 Tensor Core 单元 — Blackwell 上是模拟路径!
+ * 最小 INT4 Tensor Core 单元 (sm_89 原生 — 最后一代int4硬件, sm_90起模拟)
  *
  * 指令: mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32
  *
@@ -9,6 +9,7 @@
  *
  * 实测 SASS (2026-07, CUDA 13.0):
  *   sm_80  (A100):        1× IMMA.16864.S4.S4          ← 原生 int4 IMMA
+ *   sm_89  (Ada):         1× IMMA.16864.S4.S4          ← 原生 (实测SASS)
  *   sm_100a (B200):  36× IMAD.SHL + 2× IMMA.16832.S8   ← 解包成s8, 借int8单元模拟
  *   sm_120a (6000D): 同上模拟
  *
@@ -27,7 +28,7 @@
  * B[64×8]  (col-major): 每线程 2× uint32_t, 32线程×16 = 512 ✓
  * C/D[16×8]: 每线程 4× s32, 32线程×4 = 128 ✓
  *
- * Compile: nvcc -gencode arch=compute_100a,code=sm_100a -o mma_int4 mma_int4.cu
+ * Compile: nvcc -gencode arch=compute_89,code=sm_89 -o mma_int4 mma_int4.cu
  *          (sm_75+ 都能编; sm_80/sm_89 原生, sm_90+/Blackwell 模拟)
  */
 

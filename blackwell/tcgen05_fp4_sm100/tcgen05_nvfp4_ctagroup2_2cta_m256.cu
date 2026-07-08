@@ -10,7 +10,7 @@
  *
  * Compile:
  *   nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 -O2 \
- *        -o tcgen05_nvfp4_cg2 tcgen05_nvfp4_cg2.cu
+ *        -o tcgen05_nvfp4_ctagroup2_2cta_m256 tcgen05_nvfp4_ctagroup2_2cta_m256.cu
  */
 
 #include <cuda_runtime.h>

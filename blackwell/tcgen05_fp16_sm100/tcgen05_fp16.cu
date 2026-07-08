@@ -1,0 +1,141 @@
+/**
+ * tcgen05.mma 最小单元 — FP16 (sm_100, B100/B200)
+ *
+ * 指令: tcgen05.mma.cta_group::1.kind::f16
+ *       [tmem_c], desc_a, desc_b, idesc, p
+ *
+ * kind::f16 覆盖 fp16 和 bf16, InstrDescriptor a/b_format 选:
+ *   0 = F16 (本例), 1 = BF16 (见 tcgen05_bf16.cu)
+ * FP16: [sign|exp(5)|mant(10)], 1.0 = 0x3C00
+ * Tile:  M=128, N=8, K=16 (K = 32字节/元素2字节), 128线程 (4 warp, cta_group::1)
+ * FMA:   128 × 8 × 16 = 16,384
+ *
+ * 编译: nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 \
+ *            -o tcgen05_fp16 tcgen05_fp16.cu
+ */
+
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdint>
+
+#define CHECK_CUDA(call) do { \
+    cudaError_t e = (call); \
+    if (e != cudaSuccess) { printf("CUDA err %d: %s\n", __LINE__, cudaGetErrorString(e)); exit(1); } \
+} while(0)
+
+__device__ uint32_t smem_u32(void const* p) {
+    return static_cast<uint32_t>(__cvta_generic_to_shared(p));
+}
+
+// SmemDescriptor: [0:14) addr>>4, [16:30) stride>>4, [46:48) version=1
+__device__ uint64_t make_desc(void const* smem_ptr, int stride_bytes) {
+    uint64_t desc = 0;
+    desc |= (uint64_t)((smem_u32(smem_ptr) >> 4) & 0x3FFF);
+    desc |= (uint64_t)(((stride_bytes >> 4) & 0x3FFF)) << 16;
+    desc |= (uint64_t)(1) << 46;
+    return desc;
+}
+
+// InstrDescriptor for kind::f16:
+//   [4:6) d_format=1(f32), [7:10) a_format=0(F16), [10:13) b_format=0(F16)
+//   [17:23) n_dim=N>>3, [24:29) m_dim=M>>4
+__device__ uint32_t make_idesc() {
+    uint32_t d = 0;
+    d |= (1 << 4);                    // d_format = F32
+    // a_format = 0 (F16), b_format = 0 (F16)
+    d |= (1 << 17);                   // n_dim = N/8 = 1
+    d |= (8 << 24);                   // m_dim = M/16 = 8
+    return d;
+}
+
+constexpr int M = 128, N = 8, K = 16;
+constexpr int THREADS = 128;
+constexpr int A_BYTES = M * K * 2;  // 4096
+constexpr int B_BYTES = N * K * 2;  // 256
+
+__global__ void tcgen05_fp16_kernel(float* D_out) {
+    extern __shared__ char smem[];
+    uint32_t* smem_a    = (uint32_t*)smem;
+    uint32_t* smem_b    = (uint32_t*)(smem + A_BYTES);
+    uint32_t* smem_tmem = (uint32_t*)(smem + A_BYTES + B_BYTES + 64);
+
+    int tid = threadIdx.x, warp_id = tid / 32, lane = tid % 32;
+
+    // A=B=fp16(1.0)=0x3C00, 每uint32装2个
+    for (int i = tid; i < A_BYTES / 4; i += THREADS) smem_a[i] = 0x3C003C00u;
+    for (int i = tid; i < B_BYTES / 4; i += THREADS) smem_b[i] = 0x3C003C00u;
+    __syncthreads();
+
+    // TMEM alloc (整个warp 0)
+    if (warp_id == 0) {
+        asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
+                     : : "r"(smem_u32(smem_tmem)), "r"(32));
+    }
+    __syncthreads();
+
+    uint32_t tmem_base = *smem_tmem;
+    uint32_t tmem_c    = tmem_base;
+
+    uint64_t desc_a = make_desc(smem_a, K * 2);   // 行 = 32 bytes
+    uint64_t desc_b = make_desc(smem_b, K * 2);
+    uint32_t idesc  = make_idesc();
+
+    // tcgen05.mma FP16 (1个线程发射); p=0 → 不读入C
+    __syncthreads();
+    if (tid == 0) {
+        asm volatile(
+            "{\n\t"
+            ".reg .pred p;\n\t"
+            "setp.ne.b32 p, %4, 0;\n\t"
+            "tcgen05.mma.cta_group::1.kind::f16 "
+            "[%0], %1, %2, %3, p;\n\t"
+            "}\n"
+            : : "r"(tmem_c), "l"(desc_a), "l"(desc_b),
+                "r"(idesc), "r"(0u));
+    }
+    __syncthreads();
+
+    // 读TMEM
+    if (warp_id == 0) {
+        uint32_t r0, r1, r2, r3;
+        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n"
+                     : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(tmem_c));
+        D_out[lane * 4 + 0] = __uint_as_float(r0);
+        D_out[lane * 4 + 1] = __uint_as_float(r1);
+        D_out[lane * 4 + 2] = __uint_as_float(r2);
+        D_out[lane * 4 + 3] = __uint_as_float(r3);
+    }
+
+    // 释放TMEM
+    __syncthreads();
+    if (warp_id == 0) {
+        asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
+                     : : "r"(tmem_base), "r"(32));
+    }
+}
+
+int main() {
+    float *d_out, h[128];
+    CHECK_CUDA(cudaMalloc(&d_out, 4096));
+
+    printf("====== FP16 (tcgen05.mma, sm_100) ======\n");
+    printf("kind::f16 + a/b_format=F16\n");
+    printf("A=smem fp16(1.0), B=smem fp16(1.0)\n");
+    printf("M=%d N=%d K=%d, expect D=16.0\n\n", M, N, K);
+
+    CHECK_CUDA(cudaMemset(d_out, 0, 4096));
+    tcgen05_fp16_kernel<<<1, THREADS, 8192>>>(d_out);
+    cudaError_t e = cudaDeviceSynchronize();
+    if (e) { printf("Error: %s\n", cudaGetErrorString(e)); }
+    else {
+        CHECK_CUDA(cudaMemcpy(h, d_out, 128 * sizeof(float), cudaMemcpyDeviceToHost));
+        int pass = 0;
+        for (int i = 0; i < 128; i++) if (h[i] == 16.0f) pass++;
+        printf("Result: %d/128 correct (=16.0)\n", pass);
+        printf("D[0:8]: %.0f %.0f %.0f %.0f %.0f %.0f %.0f %.0f\n",
+               h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+    }
+
+    cudaFree(d_out);
+    return 0;
+}

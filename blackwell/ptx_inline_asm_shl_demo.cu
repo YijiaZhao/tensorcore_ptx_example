@@ -1,4 +1,4 @@
-// shl_demo.cu — 演示 shl(左移)两种写法:CUDA C 的 << 和 内联 PTX 的 shl 指令
+// ptx_inline_asm_shl_demo.cu — 演示 shl(左移)两种写法:CUDA C 的 << 和 内联 PTX 的 shl 指令
 #include <cstdio>
 #include <cstdint>
 

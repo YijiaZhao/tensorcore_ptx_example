@@ -20,9 +20,9 @@
  *        Expected D = K_total = 256 (with all-1.0 inputs in FP4)
  *
  * Compile (B300 sm_103a):
- *   nvcc -gencode arch=compute_103a,code=sm_103a -std=c++17 -O3 -o ws_tcgen05 ws_tcgen05.cu
+ *   nvcc -gencode arch=compute_103a,code=sm_103a -std=c++17 -O3 -o ws_tcgen05_nvfp4_producer_consumer_pipeline ws_tcgen05_nvfp4_producer_consumer_pipeline.cu
  * Compile (B100/B200 sm_100a):
- *   nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 -O3 -o ws_tcgen05 ws_tcgen05.cu
+ *   nvcc -gencode arch=compute_100a,code=sm_100a -std=c++17 -O3 -o ws_tcgen05_nvfp4_producer_consumer_pipeline ws_tcgen05_nvfp4_producer_consumer_pipeline.cu
  */
 
 #include <cuda_runtime.h>

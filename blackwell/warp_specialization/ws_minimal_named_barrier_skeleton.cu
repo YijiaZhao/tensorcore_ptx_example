@@ -13,7 +13,7 @@
  *   - no setmaxnreg           (1+1 warp, no register pressure)
  *
  * Compile:
- *   nvcc -arch=sm_80 -std=c++17 -O3 -o ws_min ws_minimal.cu
+ *   nvcc -arch=sm_80 -std=c++17 -O3 -o ws_min ws_minimal_named_barrier_skeleton.cu
  */
 
 #include <cuda_runtime.h>
