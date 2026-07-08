@@ -210,7 +210,6 @@ static inline int vr_verify(const VrSpec& sp, VrRunFn run, uint32_t seed) {
            sp.sset ? "+随机scale" : "", seed);
 
     static int mrow[256], mcol[256]; static bool valid[256];
-    int ncheck;
     if (sp.probe) {                          // base-4 探针实测 D 布局
         static int pr[4][256], pc[4][256], pchk[256];
         auto probe1 = [&](int ad, int bd, int dbl, int* out_) {
@@ -245,8 +244,7 @@ static inline int vr_verify(const VrSpec& sp, VrRunFn run, uint32_t seed) {
         }
         printf("D布局探针: %d/%d 槽位一致有效\n", nvalid, sp.nslot);
         if (nvalid < sp.nslot / 4) { printf("====== FAIL (探针不足) ======\n"); return 1; }
-        ncheck = nvalid;
-    } else ncheck = sp.M * sp.N;
+    }
 
     int bad = 0;
     for (int r = 0; r < ROUNDS; r++) {

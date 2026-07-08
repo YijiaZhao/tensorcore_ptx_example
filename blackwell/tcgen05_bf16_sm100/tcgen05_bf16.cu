@@ -70,6 +70,12 @@ constexpr int B_BYTES = N * K * 2;  // 256
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
 
+// ======================= 被测 kernel =======================
+// tcgen05 执行模型 (Blackwell 大卡 sm_100a 专属):
+//   - A/B 走 smem descriptor(同 wgmma); 累加器 D 不在寄存器, 住在 TMEM
+//     (Tensor Memory, 每 SM 256KB 专用, 用 tcgen05.alloc 按列分配)
+//   - 发射只要 1 个线程(对比 mma.sync 的32线程/wgmma 的128线程), 异步执行
+//   - 结果用 tcgen05.ld 从 TMEM 搬回寄存器, 必须跟 wait::ld 等完成
 __global__ void vk(const uint8_t* A, const uint8_t* B, uint32_t* D_raw) {
     extern __shared__ char smem[];
     uint32_t* sA = (uint32_t*)smem;
@@ -79,19 +85,27 @@ __global__ void vk(const uint8_t* A, const uint8_t* B, uint32_t* D_raw) {
     for (int i = tid; i < A_BYTES / 4; i += THREADS) sA[i] = ((uint32_t*)A)[i];
     for (int i = tid; i < B_BYTES / 4; i += THREADS) sB[i] = ((uint32_t*)B)[i];
     __syncthreads();
+    // ① 分配 TMEM: 整个 warp0 执行, 32 列(每列 4B×128 lane), 基址写回 smem
     if (warp_id == 0)
         asm volatile("tcgen05.alloc.cta_group::1.sync.aligned.shared::cta.b32 [%0], %1;"
                      : : "r"(smem_u32(s_tmem)), "r"(32));
     __syncthreads();
-    uint32_t tmem_c = *s_tmem;
+    uint32_t tmem_c = *s_tmem;   // 累加器 D 的 TMEM 地址
+    // ② smem descriptor: {基址>>4, LBO=128B(K方向core-matrix间距), SBO=256B(M/N方向), version=1}
     uint64_t da = make_desc(sA, 32), db = make_desc(sB, 32);
     __syncthreads();
+    // ③ 发射 MMA: 只需 1 个线程! (真实kernel用 elect.sync 选举)
+    //    tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;
+    //    操作数: [D的TMEM地址], desc_A, desc_B, idesc(指令描述符,编码M/N/格式), p(0=清零写入,1=累加)
+    //    idesc 位段: [4:6)累加器格式 [7:10)A格式 [10:13)B格式 [17:23)N/8 [24:29)M/16
     if (tid == 0) {
         asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %4, 0;\n\t"
             "tcgen05.mma.cta_group::1.kind::f16 [%0], %1, %2, %3, p;\n\t}\n"
             : : "r"(tmem_c), "l"(da), "l"(db), "r"((uint32_t)((1<<4)|(1<<7)|(1<<10)|(1<<17)|(8<<24))), "r"(0u));
     }
     __syncthreads();
+    // ④ 读回: 16x256b = D 的 16行×8列窗口; ld 是异步的, wait::ld 之后寄存器才可靠
+    //    (漏 wait::ld 是竞态 —— 全1.0数据下看不出来, 随机数据当场现形, 已实测踩过)
     if (warp_id == 0) {
         uint32_t r0, r1, r2, r3;
         asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n\t"
@@ -100,6 +114,7 @@ __global__ void vk(const uint8_t* A, const uint8_t* B, uint32_t* D_raw) {
         D_raw[lane*4+0]=r0; D_raw[lane*4+1]=r1; D_raw[lane*4+2]=r2; D_raw[lane*4+3]=r3;
     }
     __syncthreads();
+    // ⑤ 释放 TMEM (不释放会泄漏, TMEM 不随 kernel 结束自动回收干净)
     if (warp_id == 0)
         asm volatile("tcgen05.dealloc.cta_group::1.sync.aligned.b32 %0, %1;"
                      : : "r"(tmem_c), "r"(32));

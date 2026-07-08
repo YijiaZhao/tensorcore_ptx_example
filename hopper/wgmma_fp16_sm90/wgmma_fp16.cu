@@ -60,16 +60,31 @@ __device__ __forceinline__ int vr_d_pos(int tid, int r) {
     int lane = tid % 32, w = tid / 32;
     return (16 * w + lane / 4 + (r >> 1) * 8) * 8 + (lane % 4) * 2 + (r & 1);
 }
+// ======================= 被测 kernel =======================
+// wgmma 执行模型 (Hopper 专属, Blackwell 已被 tcgen05 取代):
+//   - 发射单位是 warpgroup = 4 个连续 warp = 128 线程, 全体执行同一条指令
+//   - A/B 不占寄存器: 硬件按 smem descriptor 直接从 shared memory 读
+//   - D 在寄存器, 分摊在整个 warpgroup 上; 指令是异步的, 要显式等完成
 __global__ void vk(const uint8_t* A, const uint8_t* B, float* D) {
     extern __shared__ char smem[];
     uint32_t* sA = (uint32_t*)smem; uint32_t* sB = (uint32_t*)(smem + A_BYTES);
     int tid = threadIdx.x;
+    // 数据搬进 smem (真实kernel这里是 cp.async/TMA; 注意布局必须是 core-matrix 分块)
     for (int i = tid; i < A_BYTES / 4; i += THREADS) sA[i] = ((uint32_t*)A)[i];
     for (int i = tid; i < B_BYTES / 4; i += THREADS) sB[i] = ((uint32_t*)B)[i];
     __syncthreads();
+    // 普通 st 写的 smem 要对"异步代理"(wgmma引擎)可见, 必须过这道 fence
     asm volatile("fence.proxy.async.shared::cta;");
+    // smem descriptor: 64bit 编码 {基址>>4, LBO=K方向core-matrix间距, SBO=M/N方向间距}
     uint64_t da = make_desc_wgmma(sA), db = make_desc_wgmma(sB);
     float d0, d1, d2, d3;
+    // ---- 异步指令序列(固定四段, 顺序不可少) ----
+    //   wgmma.fence        : 保证之前对累加器寄存器的读写已就绪
+    //   wgmma.mma_async    : 发射, 立即返回(不等算完!)
+    //     操作数: {D 4寄存器}, desc_A, desc_B, scale_d(p: 0=不读入C), 
+    //             之后是立即数 scale_a, scale_b(1/-1 取负), trans_a, trans_b(f16/bf16才有)
+    //   wgmma.commit_group : 把已发射的 wgmma 打包成一组
+    //   wgmma.wait_group 0 : 阻塞到"未完成组数 ≤0", 即本组算完, D 寄存器才可读
     asm volatile("{\n\t.reg .pred p;\n\tsetp.ne.b32 p, %6, 0;\n\t"
         "wgmma.fence.sync.aligned;\n\t"
         "wgmma.mma_async.sync.aligned.m64n8k16.f32.f16.f16 {%0,%1,%2,%3}, %4, %5, p, 1, 1, 0, 0;\n\t"

@@ -53,17 +53,39 @@
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
 
+// ======================= 被测 kernel =======================
+// mma.sync 执行模型: 一个 warp(32线程) 同步协作完成一条 16×8×K 的矩阵乘加,
+// A/B/C/D 全部住在寄存器里, 按 PTX 规定的 fragment 布局分摊到 32 个 lane 上。
 __global__ void vk(const uint32_t* A, const uint32_t* B, float* D) {
     int lane = threadIdx.x % 32;
+
+    // -- 装载 A fragment: 每 lane 4 个 u32 寄存器 --
+    // PTX row.col 布局(mma_a_idx 实现): 寄存器 r 拿的是
+    //   行 = lane/4 + (r&1)*8   (每 4 个 lane 一组管一行, r 的奇偶位选上/下半 8 行)
+    //   列 = 行内第 lane%4 + (r>>1)*4 个 32bit 块 (r 的高位选 K 的前/后半段)
     uint32_t a0=A[mma_a_idx(lane,0)], a1=A[mma_a_idx(lane,1)],
              a2=A[mma_a_idx(lane,2)], a3=A[mma_a_idx(lane,3)];
+    // -- 装载 B fragment: 每 lane 2 个 u32 (B 是 col-major, n = lane/4) --
     uint32_t b0=B[mma_b_idx(lane,0)], b1=B[mma_b_idx(lane,1)];
+
     int32_t d0,d1,d2,d3;
+    // ---- 指令本体 ----
+    // mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32
+    //   |        |       |   |    └ 操作数精度: D类型.A类型.B类型.C类型
+    //   |        |       |   └ row.col: A行主 × B列主 (唯一支持的组合)
+    //   |        |       └ m16n8kK: 单条指令的 tile 形状
+    //   |        └ aligned: warp 32 线程必须全部活跃且执行同一条
+    //   └ sync: 指令自带 warp 同步语义, 完成后寄存器立即可用
+    // 操作数分组: {D 4寄存器} {A 4寄存器} {B 2寄存器} {C 4寄存器}
+    // C 传 0 = 纯乘不累加; 想累加就把上一条的 D 喂回 C。
     asm volatile("mma.sync.aligned.m16n8k64.row.col.s32.s4.s4.s32 "
         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13};\n"
         : "=r"(d0),"=r"(d1),"=r"(d2),"=r"(d3)
         : "r"(a0),"r"(a1),"r"(a2),"r"(a3),"r"(b0),"r"(b1),
           "r"(0),"r"(0),"r"(0),"r"(0));
+
+    // -- 写回 D: fragment 布局与 A 同族 --
+    //   行 = lane/4 + (r>>1)*8, 列 = (lane%4)*2 + (r&1)  → 还原成线性 D[16][8]
     D[mma_d_idx(lane,0)]=(float)d0; D[mma_d_idx(lane,1)]=(float)d1;
     D[mma_d_idx(lane,2)]=(float)d2; D[mma_d_idx(lane,3)]=(float)d3;
 }
@@ -80,7 +102,8 @@ static void vr_run(const uint8_t* hA, const uint8_t* hB,
 }
 
 int main() {
+    // 验证配置: 形状/元素位宽/取值集 → vr_verify 负责 随机构造→CPU参考→逐bit比对
     VrSpec sp = {}; sp.M = 16; sp.N = 8; sp.K = 64; sp.ebits = 4; sp.is_int = 1;
     sp.dset = S4_SET; sp.dsetn = SETN(S4_SET);
-    return vr_verify(sp, vr_run, 1);
+    return vr_verify(sp, vr_run, 1);   // 退出码 0 = 全部逐bit相等
 }

@@ -65,6 +65,9 @@
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
 
+// ======================= 被测 kernel (block scale 版) =======================
+// 与普通 mma.sync 的区别: 指令末尾多了 scale 操作数, 硬件在乘加内部
+// 对 A/B 每个 K 段乘上一个 8bit scale (这是 Blackwell sm_120a 专属能力)。
 __global__ void vk(const uint32_t* A, const uint32_t* B, float* D,
                    uint32_t sfa, uint32_t sfb) {
     int lane = threadIdx.x % 32;
@@ -72,6 +75,14 @@ __global__ void vk(const uint32_t* A, const uint32_t* B, float* D,
              a2=A[mma_a_idx(lane,2)], a3=A[mma_a_idx(lane,3)];
     uint32_t b0=B[mma_b_idx(lane,0)], b1=B[mma_b_idx(lane,1)];
     float d0,d1,d2,d3;
+    // ---- 指令本体 ----
+    // mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+    //   kind::mxf4nvf4/mxf8f6f4 = block scale 家族; scale_vec::NX = 每行 K 分 N 段
+    //   末尾类型 ue8m0/ue4m3 = scale 的编码格式
+    // 操作数: {D}{A}{B}{C} 同普通版, 之后追加
+    //   {%14}=sf_A 寄存器(每段1字节, 低段在低字节)
+    //   {%15,%16}={byte-id, thread-id}: 从 warp 哪个线程的哪个字节取 scale (最小例全0 → lane0 广播)
+    //   {%17}{%18,%19} = sf_B 同理
     asm volatile("mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
         "{%0,%1,%2,%3},{%4,%5,%6,%7},{%8,%9},{%10,%11,%12,%13},"
         "{%14},{%15,%16},{%17},{%18,%19};\n"
