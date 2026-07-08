@@ -33,10 +33,12 @@ __device__ uint32_t smem_u32(void const* p) {
 }
 
 // Hopper wgmma SmemDescriptor: [0:14) addr>>4, [16:30) LBO>>4, [32:46) SBO>>4, [62:64) swizzle=0
+// ⚠️ no-swizzle 布局是 8行×16B core-matrix 分块(不是线性行主): LBO=128B, SBO=256B (H20实测)
+//    本例全1.0输入对排布不敏感; 喂真实数据时 smem 必须按 core-matrix 排, 见 random_cpu_ref/
 __device__ uint64_t make_desc_wgmma(void const* smem_ptr) {
     uint64_t desc = 0;
     desc |= (uint64_t)((smem_u32(smem_ptr) >> 4) & 0x3FFF);
-    desc |= (uint64_t)1  << 16;   // LBO = 16B  >> 4
+    desc |= (uint64_t)8  << 16;   // LBO = 128B >> 4
     desc |= (uint64_t)16 << 32;   // SBO = 256B >> 4
     return desc;
 }

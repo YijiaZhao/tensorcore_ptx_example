@@ -58,7 +58,10 @@ __device__ __forceinline__ uint32_t smem_u32(void const* p) {
 __device__ __forceinline__ uint64_t make_desc(void const* smem_ptr, int stride_bytes) {
     uint64_t desc = 0;
     desc |= (uint64_t)((smem_u32(smem_ptr) >> 4) & 0x3FFF);
-    desc |= (uint64_t)(((stride_bytes >> 4) & 0x3FFF)) << 16;
+    // ⚠️ no-swizzle 实际是 8行×16B core-matrix 分块(全1.0输入不敏感, 真实数据排布见 random_cpu_ref/)
+    (void)stride_bytes;
+    desc |= (uint64_t)8  << 16;   // LBO = 128B >> 4
+    desc |= (uint64_t)16 << 32;   // SBO = 256B >> 4
     desc |= (uint64_t)(1) << 46;
     return desc;
 }

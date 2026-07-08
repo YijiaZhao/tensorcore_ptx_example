@@ -34,11 +34,15 @@ __device__ uint32_t smem_u32(void const* p) {
     return static_cast<uint32_t>(__cvta_generic_to_shared(p));
 }
 
-// SmemDescriptor: [0:14) addr>>4, [16:30) stride>>4, [46:48) version=1
+// SmemDescriptor: [0:14) addr>>4, [16:30) LBO>>4, [32:46) SBO>>4, [46:48) version=1
+// ⚠️ no-swizzle 布局是 8行×16B core-matrix 分块(不是线性行主): K方向间距LBO=128B, M/N方向SBO=256B
+//    本例全1.0输入对排布不敏感; 喂真实数据时 smem 必须按 core-matrix 排, 见 random_cpu_ref/
 __device__ uint64_t make_desc(void const* smem_ptr, int stride_bytes) {
+    (void)stride_bytes;
     uint64_t desc = 0;
     desc |= (uint64_t)((smem_u32(smem_ptr) >> 4) & 0x3FFF);
-    desc |= (uint64_t)(((stride_bytes >> 4) & 0x3FFF)) << 16;
+    desc |= (uint64_t)8  << 16;   // LBO = 128B >> 4
+    desc |= (uint64_t)16 << 32;   // SBO = 256B >> 4
     desc |= (uint64_t)(1) << 46;
     return desc;
 }
@@ -105,7 +109,8 @@ __global__ void tcgen05_fp8_kernel(float* D_out) {
     // 读TMEM
     if (warp_id == 0) {
         uint32_t r0, r1, r2, r3;
-        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n"
+        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n\t"
+                     "tcgen05.wait::ld.sync.aligned;\n"
                      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(tmem_c));
         D_out[lane * 4 + 0] = __uint_as_float(r0);
         D_out[lane * 4 + 1] = __uint_as_float(r1);

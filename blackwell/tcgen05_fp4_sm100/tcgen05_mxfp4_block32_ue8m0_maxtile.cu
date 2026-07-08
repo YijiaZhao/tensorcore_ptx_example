@@ -26,7 +26,10 @@ __device__ uint32_t smem_u32(void const* p) {
 __device__ uint64_t make_desc(void const* smem_ptr, int stride_bytes) {
     uint64_t desc = 0;
     desc |= (uint64_t)((smem_u32(smem_ptr) >> 4) & 0x3FFF);
-    desc |= (uint64_t)(((stride_bytes >> 4) & 0x3FFF)) << 16;
+    // ⚠️ no-swizzle 实际是 8行×16B core-matrix 分块(全1.0输入不敏感, 真实数据排布见 random_cpu_ref/)
+    (void)stride_bytes;
+    desc |= (uint64_t)8  << 16;   // LBO = 128B >> 4
+    desc |= (uint64_t)16 << 32;   // SBO = 256B >> 4
     desc |= (uint64_t)(1) << 46;
     return desc;
 }
@@ -110,7 +113,8 @@ __global__ void tcgen05_mxfp4_max_kernel(float* D_out) {
 
     if (warp_id == 0) {
         uint32_t r0, r1, r2, r3;
-        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n"
+        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3}, [%4];\n\t"
+                     "tcgen05.wait::ld.sync.aligned;\n"
                      : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3) : "r"(tmem_c));
         D_out[lane * 4 + 0] = __uint_as_float(r0);
         D_out[lane * 4 + 1] = __uint_as_float(r1);

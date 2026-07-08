@@ -12,7 +12,8 @@ __device__ uint32_t su32(void const* p){return static_cast<uint32_t>(__cvta_gene
 __device__ uint64_t mkdesc(void const* p, int stride){
     uint64_t d=0;
     d|=(uint64_t)((su32(p)>>4)&0x3FFF);
-    d|=(uint64_t)(((stride>>4)&0x3FFF))<<16;
+    (void)stride;  // ⚠️ no-swizzle 是 8行×16B core-matrix 分块; LBO=128B SBO=256B (全1.0不敏感)
+    d|=(uint64_t)8<<16; d|=(uint64_t)16<<32;
     d|=(uint64_t)(1)<<46;
     return d;
 }
@@ -63,7 +64,8 @@ __global__ void test_cg1(float* out, int* status) {
 
     if(wid==0){
         uint32_t r0,r1,r2,r3;
-        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3},[%4];\n"
+        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3},[%4];\n\t"
+            "tcgen05.wait::ld.sync.aligned;\n"
                      :"=r"(r0),"=r"(r1),"=r"(r2),"=r"(r3):"r"(tc));
         if(tid==0){
             out[0]=__uint_as_float(r0);
@@ -123,7 +125,8 @@ __global__ void test_cg2(float* out, int* status) {
 
     if(wid==0){
         uint32_t r0,r1,r2,r3;
-        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3},[%4];\n"
+        asm volatile("tcgen05.ld.sync.aligned.16x256b.x1.b32 {%0,%1,%2,%3},[%4];\n\t"
+            "tcgen05.wait::ld.sync.aligned;\n"
                      :"=r"(r0),"=r"(r1),"=r"(r2),"=r"(r3):"r"(tc));
         if(tid==0){
             out[0]=__uint_as_float(r0);
