@@ -199,6 +199,17 @@ docker run --rm --gpus all -v <本仓库路径>:/work \
 - **`tcgen05_random_cpu_ref_sm100.cu`**：五精度 tcgen05，D 读回布局用 one-hot 探针实测（不做假设），
   一致性探针自动过滤 TMEM 跨 kernel 残留槽位
 
+跑法（-gencode 按第 5 节开头的架构表换）：
+
+```bash
+cd random_cpu_ref
+nvcc -gencode arch=compute_120a,code=sm_120a -std=c++17 -o t mma_random_cpu_ref_all_arch.cu
+./t          # 默认 seed=1, 每精度3轮; 期望每行 "PASS (128/128 exact)", 最后 "全部PASS"
+./t 42       # 换个 seed 复跑 (确定性随机, 同seed结果可复现)
+# wgmma/tcgen05 版同理; tcgen05 版会先打印 "D布局探针: OK, 64/128 槽位一致有效"
+# 退出码: 0=全过, 非0=有FAIL (可以直接进CI)
+```
+
 这套测试实际抓出过两个"全 1.0 全对、随机数据全错"的真问题（已修，教训写在文件头）：
 1. **GMMA/UMMA smem descriptor 的 no-swizzle 布局不是线性行主**，是 8行×16B core-matrix 分块，
    K 方向 core-matrix 间距(LBO)=128B、M 方向(SBO)=256B —— 参数扫描实测钉死
