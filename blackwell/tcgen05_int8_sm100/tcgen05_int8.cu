@@ -137,7 +137,11 @@ static void vr_run(const uint8_t* hA, const uint8_t* hB,
     cudaMemcpy(dA, hA, A_BYTES, cudaMemcpyHostToDevice);
     cudaMemcpy(dB, hB, B_BYTES, cudaMemcpyHostToDevice);
     vk<<<1, THREADS, A_BYTES + B_BYTES + 128>>>(dA, dB, dD);
-    cudaDeviceSynchronize();
+    if (cudaDeviceSynchronize() != cudaSuccess) {   // 架构不匹配等错误在这里就报清楚, 不带着全零结果去比对
+        printf("CUDA错误: %s (编译的-gencode和当前GPU匹配吗? 见文件头编译行)\n",
+               cudaGetErrorString(cudaGetLastError()));
+        exit(1);
+    }
     cudaMemcpy(out, dD, 512, cudaMemcpyDeviceToHost);
 }
 
