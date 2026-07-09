@@ -138,5 +138,5 @@ int main() {
     VrSpec sp = {}; sp.M = 128; sp.N = 8; sp.K = K; sp.ebits = 32; sp.is_int = 0;
     sp.dset = TF32_SET; sp.dsetn = SETN(TF32_SET); sp.core_matrix = 1;
     sp.probe = 1; sp.nslot = 128; sp.enc_tab = VR_ENC_TF32; sp.sf_one = 0;
-    return vr_verify(sp, vr_run, 1);
+    return vr_verify(sp, vr_run, /*seed=*/1);   // 随机全在CPU侧生成(见verify_random.h数据流注释); 同seed可复现
 }

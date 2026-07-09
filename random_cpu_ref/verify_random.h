@@ -1,11 +1,22 @@
 /**
- * verify_random.h — 随机数据 + CPU 参考 的可复用正确性验证工具
+ * verify_random.h — 随机数据 + CPU 参考 的可复用正确性验证工具 (教学仓库公共件)
  *
- * 用法(见同目录三个 .cu):
- *   1. fill_random() 生成随机 A/B: 编码写进 GPU 要吃的 buffer, float 值写进 ref 数组
- *   2. GPU 跑 tensor core 指令
- *   3. cpu_gemm_ref() 算参考 D[m][n] = Σ_k A[m][k]*B[n][k]
- *   4. check() 逐元素精确比对 (==, 不是容差)
+ * ============ 整体数据流(谁在哪生成什么, 教学重点) ============
+ *
+ *   [CPU/host]  xorshift 确定性伪随机 → fill_random() 一次抽数、双份落地:
+ *                  编码(bit形式) → hA/hB   (GPU 要吃的)
+ *                  float值      → refA/refB (CPU 参考要用的)
+ *               cpu_gemm_ref() 三重循环算出标准答案 refD  ← 数学定义本身, 不会错
+ *   [cudaMemcpy H2D]  编码上卡
+ *   [GPU]       只干一件事: 跑被测 tensor core 指令 (kernel 里没有任何随机逻辑)
+ *   [cudaMemcpy D2H]  结果回 host
+ *   [CPU]       check_exact() 逐元素 == 比对
+ *
+ *   随机性 100% 在 CPU 侧产生: 保证两边看到同一组数、同 seed 任何机器可复现、
+ *   被测路径纯净(GPU 侧只有指令+搬运, 出错时嫌疑范围最小)。
+ *
+ * 用法: 每个 .cu 填一个 VrSpec + 写一个 launch 适配器, main 调 vr_verify() 即可,
+ *       上述全部流程(含 tcgen05 的 D 布局探针)由 vr_verify() 统一驱动。
  *
  * 为什么可以用 == :
  *   取值集合刻意限制在 {0, ±0.5, ±1, ±1.5, ±2} —— 两两乘积 ∈ ±[0.25,4],
@@ -200,6 +211,8 @@ struct VrSpec {
 typedef void (*VrRunFn)(const uint8_t* hA, const uint8_t* hB,
                         const uint32_t* sfa_enc, const uint32_t* sfb_enc, void* out);
 
+// 通用驱动: [探针测D布局(可选)] → 每轮{CPU抽随机数→CPU算参考→run()跑GPU→逐bit比对}
+// seed 是唯一随机源(host侧xorshift), 同seed全序列可复现 —— 调试FAIL时直接复跑
 static inline int vr_verify(const VrSpec& sp, VrRunFn run, uint32_t seed) {
     static uint8_t hA[256 * 32], hB[256 * 32];
     static float refA[256 * 64], refB[256 * 64], refD[256 * 256];

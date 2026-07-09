@@ -110,5 +110,5 @@ static void vr_run(const uint8_t* hA, const uint8_t* hB,
 int main() {
     VrSpec sp = {}; sp.M = 64; sp.N = 8; sp.K = 8; sp.ebits = 32; sp.is_int = 0;
     sp.dset = TF32_SET; sp.dsetn = SETN(TF32_SET); sp.core_matrix = 1;
-    return vr_verify(sp, vr_run, 1);
+    return vr_verify(sp, vr_run, /*seed=*/1);   // 随机全在CPU侧生成(见verify_random.h数据流注释); 同seed可复现
 }

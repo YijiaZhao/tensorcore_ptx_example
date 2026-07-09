@@ -98,5 +98,5 @@ int main() {
     // 验证配置: 形状/元素位宽/取值集 → vr_verify 负责 随机构造→CPU参考→逐bit比对
     VrSpec sp = {}; sp.M = 16; sp.N = 8; sp.K = 16; sp.ebits = 16; sp.is_int = 0;
     sp.dset = FP16_SET; sp.dsetn = SETN(FP16_SET);
-    return vr_verify(sp, vr_run, 1);   // 退出码 0 = 全部逐bit相等
+    return vr_verify(sp, vr_run, /*seed=*/1);   // 随机全在CPU侧生成(见verify_random.h数据流注释); 同seed可复现; 退出码0=全部逐bit相等
 }

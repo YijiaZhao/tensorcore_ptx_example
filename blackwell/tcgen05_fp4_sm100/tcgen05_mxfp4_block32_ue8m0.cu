@@ -150,5 +150,5 @@ int main() {
     sp.dset = E2M1_SET; sp.dsetn = SETN(E2M1_SET); sp.core_matrix = 1;
     sp.probe = 1; sp.nslot = 128; sp.enc_tab = VR_ENC_E2M1; sp.sf_one = 0x7F;
     sp.sset = UE8M0_SET; sp.ssetn = SETN(UE8M0_SET); sp.nseg = 1;
-    return vr_verify(sp, vr_run, 1);
+    return vr_verify(sp, vr_run, /*seed=*/1);   // 随机全在CPU侧生成(见verify_random.h数据流注释); 同seed可复现
 }

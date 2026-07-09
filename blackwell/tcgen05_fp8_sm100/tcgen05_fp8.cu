@@ -137,5 +137,5 @@ int main() {
     VrSpec sp = {}; sp.M = 128; sp.N = 8; sp.K = K; sp.ebits = 8; sp.is_int = 0;
     sp.dset = E4M3_SET; sp.dsetn = SETN(E4M3_SET); sp.core_matrix = 1;
     sp.probe = 1; sp.nslot = 128; sp.enc_tab = VR_ENC_E4M3; sp.sf_one = 0;
-    return vr_verify(sp, vr_run, 1);
+    return vr_verify(sp, vr_run, /*seed=*/1);   // 随机全在CPU侧生成(见verify_random.h数据流注释); 同seed可复现
 }

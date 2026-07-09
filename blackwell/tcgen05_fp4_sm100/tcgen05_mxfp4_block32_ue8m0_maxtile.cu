@@ -240,5 +240,5 @@ inline int random_vs_cpu(uint32_t seed) {
 }  // namespace p2
 
 int main() {
-    return p2::random_vs_cpu(1);
+    return p2::random_vs_cpu(/*seed=*/1);   // 随机全在CPU侧生成, 同seed可复现
 }

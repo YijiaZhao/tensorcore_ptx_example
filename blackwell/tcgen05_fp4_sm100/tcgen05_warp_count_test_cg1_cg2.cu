@@ -333,7 +333,7 @@ int main() {
     for (int i = 0; i < 3; i++) {
         printf("\n########## warps = %d ##########\n", warp_list[i]);
         p2::g_warps = warp_list[i];
-        rc |= p2::random_vs_cpu(1);
+        rc |= p2::random_vs_cpu(/*seed=*/1);   // 随机全在CPU侧生成, 同seed可复现
     }
     return rc;
 }

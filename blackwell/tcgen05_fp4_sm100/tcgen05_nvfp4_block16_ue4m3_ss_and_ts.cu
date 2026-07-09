@@ -358,7 +358,7 @@ static int phase2_ts_random(uint32_t seed) {
 }
 
 int main() {
-    int rc = phase2_random_vs_cpu(1);   // SS
-    rc |= phase2_ts_random(1);          // TS
+    int rc = phase2_random_vs_cpu(/*seed=*/1);   // SS
+    rc |= phase2_ts_random(/*seed=*/1);          // TS
     return rc;
 }
