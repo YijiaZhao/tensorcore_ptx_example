@@ -143,7 +143,12 @@ blackwell/                          sm_100a (tcgen05) + sm_120a (mma.sync 扩展
   ptx_inline_asm_shl_demo.cu        PTX 内联汇编入门 (与 tensor core 无关)
 ```
 
-## 5. 怎么编译、怎么跑
+## 5. 数据排布图解 → [LAYOUT.md](LAYOUT.md)
+
+三种路径三套排布（mma.sync 寄存器 fragment / smem core-matrix 瓷砖 / TMEM 探针测绘），
+完整图解和地址公式见 [LAYOUT.md](LAYOUT.md)——这是最容易踩坑、全 1.0 测试无法暴露的部分。
+
+## 6. 怎么编译、怎么跑
 
 ### 环境：统一 docker 镜像（宿主机零依赖）
 
