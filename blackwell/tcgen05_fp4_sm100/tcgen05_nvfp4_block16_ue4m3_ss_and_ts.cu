@@ -74,6 +74,8 @@ constexpr int B_BYTES = N * K / 2;  // 256
 //   D 布局用 base-4 探针实测 + 一致性过滤(见 tcgen05 常规精度文件, 同一框架)。
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
+// (随机数全部在 CPU 侧生成: 本文件的 fill_random/xorshift 调用都跑在 host 上,
+//  编码与float值同源双份 → GPU只跑指令, CPU算参考, 逐bit比对; 同seed可复现)
 
 static const int EBITS = 4;
 static uint32_t phase2_enc_small(int v) {   // e2m1: {0,1,2,3,4,6}
