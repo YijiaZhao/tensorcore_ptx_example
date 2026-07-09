@@ -75,6 +75,8 @@ __device__ uint32_t make_idesc(uint32_t tmem_sfa, uint32_t tmem_sfb) {
 //   D 布局用 base-4 探针在双CTA的256个读回槽位上实测 + 一致性过滤。
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
+// (随机数全部在 CPU 侧生成: 本文件的 fill_random/xorshift 调用都跑在 host 上,
+//  编码与float值同源双份 → GPU只跑指令, CPU算参考, 逐bit比对; 同seed可复现)
 
 namespace p2 {
 constexpr int ML = 256, NN = 16, KK = 64, EBITS = 4, NSLOT = 256;

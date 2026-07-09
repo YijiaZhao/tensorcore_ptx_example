@@ -43,8 +43,18 @@
 // (原阶段1全1.0测试已移除: 随机vs CPU为严格超集 — PHASE1_STRIPPED)
 
 // ============================================================
-// 验证: 随机数据 vs CPU 参考 (逐bit精确) — host驱动统一在 verify_random.h::vr_verify()
-//   本文件只保留: 被测kernel + launch适配器
+// 验证: 随机数据 vs CPU 参考 (逐bit精确)
+//
+// 随机数在哪生成? —— 全部在 CPU 侧(不在本文件、不在GPU):
+//   main 把种子交给 vr_verify()(verify_random.h), 它在 host 上用 xorshift 抽数,
+//   每抽一个数同时落两份: 编码(bit形式)进 GPU buffer, float值进 CPU 参考数组
+//   —— 一次抽取喂两边, 天然保证 CPU 和 GPU 算的是同一组数。
+//
+// 完整数据流:  [CPU]抽随机+算参考答案 → cudaMemcpy上卡 → [GPU]只跑下面这条
+//   tensor core 指令(kernel里零随机逻辑) → 拷回 → [CPU]逐元素 == 比对。
+//   取值集限制在 {0,±0.5,±1,±1.5,±2}: 任意累加顺序 fp32 零舍入, 所以敢用 ==。
+//
+// 本文件只保留: 被测kernel + launch适配器; 其余(抽数/参考/比对/探针)在公共驱动。
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
 
@@ -78,6 +88,8 @@ __global__ void vk(const uint32_t* A, const uint32_t* B, float* D,
     D[mma_d_idx(lane,2)]=d2; D[mma_d_idx(lane,3)]=d3;
 }
 
+// launch适配器: 只做 H2D搬运→启动kernel→D2H。不产生任何随机数(那是CPU侧驱动的事),
+// 也不做比对 —— 保持被测路径纯净: 出错时嫌疑只剩"这条指令+这段搬运"。
 static void vr_run(const uint8_t* hA, const uint8_t* hB,
                    const uint32_t* sfa, const uint32_t* sfb, void* out) {
     static uint8_t *dA, *dB; static float* dD;

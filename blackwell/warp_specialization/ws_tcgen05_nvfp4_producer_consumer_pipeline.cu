@@ -256,6 +256,8 @@ ws_tcgen05_kernel(uint8_t const* __restrict__ gmem_A,
 //   D 布局 base-4 探针实测; scale 固定1.0(kernel内写死, 属流水线demo参数)。
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
+// (随机数全部在 CPU 侧生成: 本文件的 fill_random/xorshift 调用都跑在 host 上,
+//  编码与float值同源双份 → GPU只跑指令, CPU算参考, 逐bit比对; 同seed可复现)
 
 namespace p2 {
 constexpr int EBITS = 4, NSLOT = 128, KTOT = K_TILE * K_ITERS;

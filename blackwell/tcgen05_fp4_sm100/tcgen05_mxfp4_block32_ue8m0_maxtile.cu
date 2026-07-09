@@ -61,6 +61,8 @@ constexpr int B_BYTES = N * K / 2;  // 8192
 //   scale 每轮随机、段间一致(段独立需先摸TMEM sf字节→K段映射, 不做假设)。
 // ============================================================
 #include "../../random_cpu_ref/verify_random.h"
+// (随机数全部在 CPU 侧生成: 本文件的 fill_random/xorshift 调用都跑在 host 上,
+//  编码与float值同源双份 → GPU只跑指令, CPU算参考, 逐bit比对; 同seed可复现)
 
 namespace p2 {
 constexpr int M = 128, N = 256, K = 64, KLOOP = 1, EBITS = 4, THREADS = 128;
