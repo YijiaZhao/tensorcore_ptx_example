@@ -7,6 +7,8 @@
 
 ## 1. mma.sync：寄存器 fragment 布局
 
+![mma.sync fragment 布局](figures/fig1_mma_fragment.svg)
+
 ### 1.1 先记住两个坐标
 
 warp 的 32 个 lane 先按 4 个一组分组：
@@ -87,6 +89,8 @@ threadID = lane % 4     ∈ 0..3    ← 组内位置
 
 ## 2. wgmma / tcgen05：smem 的 core-matrix 瓷砖排布
 
+![core-matrix 瓷砖排布](figures/fig2_core_matrix.svg)
+
 ### 2.1 错误直觉 vs 硬件现实
 
 A[16行 × 32字节/行]，你以为往 smem 里这样放（线性行主）：
@@ -146,6 +150,8 @@ A[16行 × 32字节/行]，你以为往 smem 里这样放（线性行主）：
 ---
 
 ## 3. tcgen05 的 TMEM：D 的排布用探针实测
+
+![TMEM 与探针](figures/fig3_tmem_probe.svg)
 
 ### 3.1 TMEM 长什么样
 
