@@ -130,6 +130,8 @@ hopper/                             sm_90a
   mma.sync_fp8_sm90_fp16emu/        ← 模拟, 原生请用 wgmma
   mma.sync_int4_sm90_int8emu/
   wgmma_{fp16,bf16,tf32,fp8,int8}_sm90/
+  prmt_decode_mxfp4_to_e4m3_sm90/    ← 快速解码 e2m1→fp8, prmt查表 8/次 (MegaMoE热路径)
+  mask_decode_int4_to_int8_sm90/     ← 快速解码 int4→int8, shift+mask 8/次
 
 blackwell/                          sm_100a (tcgen05) + sm_120a (mma.sync 扩展)
   mma.sync_{fp16,bf16,tf32,int8}_sm100_sm120/
