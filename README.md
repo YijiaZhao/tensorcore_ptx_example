@@ -140,7 +140,8 @@ blackwell/                          sm_100a (tcgen05) + sm_120a (mma.sync 扩展
   mma.sync_fp4_sm120/               nvfp4(block16 ue4m3) + mxfp4(block32 ue8m0)
   tcgen05_{fp16,bf16,tf32,fp8,int8}_sm100/ (fp8 目录含 mxfp8 block scale)
   tcgen05_fp4_sm100/                nvfp4/mxfp4 + maxtile + cta_group::2 + warp数实验
-  warp_specialization/              producer/consumer 流水线 (named barrier / mbarrier / setmaxnreg)
+  warp_specialization_sm100/        sm_100a/103a: tcgen05 + TMEM, LDGSTS/TMA multistage
+  warp_specialization_sm120/        sm_120a: mma.sync NVFP4, LDGSTS/TMA multistage
   comm/                             TMA / P2P / multimem 通信最小例
   ptx_inline_asm_shl_demo.cu        PTX 内联汇编入门 (与 tensor core 无关)
 ```
