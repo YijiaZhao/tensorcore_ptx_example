@@ -26,9 +26,9 @@ Headline (two-shot, 8 GPUs, clocks locked, µs; **fused NVFP4 vs TRT-LLM FP8**):
 | B200 ×8 | NVLink | **1.84×** | **1.91×** | **1.80×** | **1.91×** |
 | GB300 2×4 (NVL72) | NVLink cross-node | **1.73×** | **1.78×** | **1.67×** | **1.78×** |
 | RTX 6000D ×8 (PCIe) | PCIe | **3.23×** (32K) · **4.63×** (128K) · **4.48×** (512K) | **2.72×** (8M) | — | — |
-| RTX PRO 6000 ×8 (PCIe) | PCIe | see §4.2 | see §4.2 | — | — |
+| RTX PRO 6000 ×8 (PCIe) | PCIe | **2.65×** (32K) · **3.54×** (128K) · **2.65×** (512K) | **2.21×** (8M) | — | — |
 
-vs TRT-LLM BF16 custom AR the fused NVFP4 kernel is 5.5–11.8× faster on NVLink and 3.7–4.6× on PCIe.
+vs TRT-LLM BF16 custom AR the fused NVFP4 kernel is 3.9–11.8× faster on NVLink (≥8M) and 1.5–4.6× on PCIe; on PCIe `NV_GRID=4` adds another 1.2–1.8×.
 Accuracy cost: rel_rmse 0.14 (two quantization passes) vs 0.037 (FP8) vs 0.004 (BF16).
 
 ---
@@ -38,7 +38,7 @@ Accuracy cost: rel_rmse 0.14 (two quantization passes) vs 0.037 (FP8) vs 0.004 (
 | GPU | sm | GPUs | interconnect | build toolchain | clock lock (verified by `nvidia-smi --query-gpu=clocks.sm` after each run) |
 |---|---|---|---|---|---|
 | RTX 6000D (cc 12.0) | sm_120 | 8 | PCIe | CUDA 13.3 nvcc, local | `nvidia-smi -lgc <max>` → 2347 MHz |
-| RTX PRO 6000 Blackwell Server Edition | sm_120 | 8 | PCIe | static binary (`-cudart static`) built with CUDA 13.3 on an x86 host; no toolkit on the node | slurm `--gpu-freq=high` → 2422 MHz |
+| RTX PRO 6000 Blackwell Server Edition | sm_120 | 8 | PCIe | static binary (`-cudart static`) built with CUDA 13.3 on an x86 host; no toolkit on the node | slurm `--gpu-freq=high` → 2347 MHz |
 | B200 (cc 10.0) | sm_100 | 8 | NVLink | static binary built with CUDA 13.3 on an x86 host | slurm `--gpu-freq=1965` → 1965 MHz |
 | GB300 NVL72 (cc 10.3, aarch64) | sm_103 | 8 = **2 nodes × 4** | NVLink (intra-rack, cross-node) | built inside `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc13` (CUDA 13.1, aarch64); no toolkit on the node | `--gpu-freq=high` requested (slurm reported `control_disabled`); read back 2070 MHz = GB300 max SM clock |
 
@@ -277,10 +277,26 @@ conservative choice, pass `NV_GRID`/`grid` for the last 1.3–1.8×. Below 512K 
 slower than its own BF16 kernel on PCIe (the preprocess pass and 16-block dispatch dominate). Split-path phases at 8M: RS 10289 / AG 9446 µs; the
 barriers absorb 300–600 µs of rank skew on PCIe.
 
-### 4.2 PCIe — RTX PRO 6000 Blackwell SE, 8 GPUs, sm_120, locked 2422 MHz (µs)
+### 4.2 PCIe — RTX PRO 6000 Blackwell SE, 8 GPUs, sm_120, locked 2347 MHz (µs)
 
-_(pending — being re-run with the final kernels; the previous-version numbers were NVFP4 split
-1249 / 25872 µs vs TRT-FP8 1881 / 30411 at 512K / 8M, i.e. 1.51× / 1.18×.)_
+| numel | shape | TRT-BF16 | TRT-FP8 | myFP8 | NVFP4 split | **NVFP4 fused** | fused/BF16 | **fused/TRT-FP8** | split/TRT-FP8 |
+|---:|---|---:|---:|---:|---:|---:|:--:|:--:|:--:|
+| 32K | two-shot | 73 | 134 (g16) | 94 | 92 | **51** (g16) | 1.5× | **2.65×** | 1.46× |
+| 32K | two-shot, `NV_GRID=4` | | | | | **32** | 2.2× | **4.26×** | |
+| 128K | two-shot | 348 | 396 (g16) | 288 | 147 | **112** (g16) | 3.1× | **3.54×** | 2.70× |
+| 128K | two-shot, `NV_GRID=4` | | | | | **90** | 3.8× | **4.33×** | |
+| 512K | two-shot | 1474 | 1183 (g16) | 1153 | 559 | **447** (g16) | 3.3× | **2.65×** | 2.12× |
+| 512K | two-shot, `NV_GRID=4` | | | | | **333** | 4.5× | **3.55×** | |
+| 8M | two-shot | 29982 | 21314 (g133) | 13860 | 11173 | **9638** (g128) | 3.1× | **2.21×** | 1.91× |
+| 8M | two-shot, `NV_GRID=4` | | | | | **5354** | 5.6× | **3.98×** | |
+| 32K | one-shot | 367 | — | 158 | **81** | | 4.5× | 2.0× vs myFP8 | |
+| 128K | one-shot | 1567 | — | 676 | **315** | | 5.0× | 2.1× vs myFP8 | |
+| 512K | one-shot | 6799 | — | 4387 | **1150** | | 5.9× | 3.8× vs myFP8 | |
+| 8M | one-shot | 117689 | — | 85668 | **47298** | | 2.5× | 1.8× vs myFP8 | |
+
+Same picture as the 6000D: PCIe wants 4 blocks (1.2–1.8× over the 16/128-block default), and TRT-LLM's
+FP8 kernel is slower than its own BF16 kernel below 512K. This box is about 1.4–1.6× faster than the
+6000D at 8M (PCIe Gen5 switch topology vs the 6000D's), the NVFP4/TRT-FP8 ratios are within 10–20 %.
 
 ### 4.3 NVLink — B200, 8 GPUs, sm_100, locked 1965 MHz (µs), two-shot
 
@@ -368,10 +384,10 @@ decode (PRMT or hardware cvt) fixes that, and after it the access pattern (§2.4
 
 ## 5. Conclusions
 
-1. **vs TRT-LLM BF16 custom AR: NVFP4 fused wins 5.5–11.8× on NVLink and 3.7–4.6× on PCIe** (two-shot,
-   8 GPUs); 6–7× one-shot on NVLink.
+1. **vs TRT-LLM BF16 custom AR: NVFP4 fused wins 3.9–11.8× on NVLink from 8M up and 1.5–5.6× on PCIe**
+   (two-shot, 8 GPUs); below ~1M on NVLink both sit on the ~30 µs latency floor and tie.
 2. **vs TRT-LLM's real FP8 kernel (fair grid): NVFP4 fused wins at every size on every card** — B200 1.29–1.91× (32K–2G),
-   GB300 2×4 1.16–1.78× (32K–2G), RTX 6000D 2.7–4.5× (up to 3.7× at 8M with an 8-block grid). The byte ratio
+   GB300 2×4 1.16–1.78× (32K–2G), RTX 6000D 2.7–4.6× and RTX PRO 6000 2.2–3.5× (32K–8M; 4.0–6.8× with a 4-block grid). The byte ratio
    is 1.89×; at ≥128M on NVLink the kernel realises 1.8–1.9× of it.
 3. **Follow TRT-LLM's access pattern, not just its algorithm.** The first version kept the two-shot
    algorithm but used an unrotated owner order and 4-byte loads and lost 17–31 % to TRT-FP8 on
