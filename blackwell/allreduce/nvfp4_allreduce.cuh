@@ -5,16 +5,20 @@
 // BF16 custom AR 1.7-5x and TRT-LLM's FP8 low-precision AR 1.2-2.1x (PCIe) by moving fewer
 // bytes on the wire (NVFP4 0.5625 B/elt vs FP8 ~1.06 vs BF16 2.0). See README.md for tables.
 //
-// Algorithm (TRT-LLM twoShotAllReduceKernel shape, NVFP4 payload):
-//   0. each rank quantizes its BF16 input -> NVFP4 into its peer-visible payload
-//   1. barrier
-//   2. reduce-scatter: each rank owns shard s=[rank*shard, (rank+1)*shard); it reads
-//      EVERY peer's NVFP4 payload over ITS shard only, dequant->FP32 accumulate,
-//      then RE-QUANTIZES the reduced shard to NVFP4 ONCE into a separate reduced buffer
-//   3. barrier
-//   4. all-gather: each rank pulls every shard's reduced NVFP4 result from its owner,
-//      dequant -> BF16 output.
-//   Traffic is O(N) (each rank moves ~2(N-1)/N), not O(N^2).
+// Two entry points, both following TRT-LLM's twoShotAllReduceKernel access pattern
+// (rank-rotated peer order, 16-byte loads/stores, PUSH reduce-scatter):
+//
+//   launch_fused_rank()   ONE kernel (recommended): quantize+push -> block_barrier -> local
+//                         reduce + requantize -> block_barrier -> pull + dequantize. This is
+//                         TRT-LLM's fused two-shot with the payload swapped for NVFP4.
+//   launch_twoshot_rank() five launches (quantize | barrier | reduce-scatter | barrier |
+//                         all-gather) — same kernels split up, useful for per-phase timing.
+//
+// Both: each rank owns shard s=[rank*shard,(rank+1)*shard); the reduced shard is requantized
+// to NVFP4 ONCE (scale SFScaleVal/world) before the all-gather. Traffic is O(N) per rank.
+// Every thread moves 32 elements = 16 B packed E2M1 + 2 B block scales per peer; without that
+// (4 B/thread) the all-gather was request-bound at ~200 GB/s on NVLink, and without the rank
+// rotation all ranks read owner 0 first (7 readers on one GPU's NVLink egress) — see README.
 //
 // Wire format: NVFP4 = E2M1 packed (numel/2 B) + per-16 UE4M3 block scale (numel/16 B)
 //              + per-tensor FP32 global scale. ~0.5625 B/elt = 3.56x smaller than BF16.
@@ -26,8 +30,8 @@
 //   The -arch=sm_XXXa shorthand does NOT enable them in nvcc 13.x (ptxas "not supported").
 //
 // IPC / peer-pointer contract:
-//   The caller is responsible for making each rank's `payload` and `reduced` buffers
-//   peer-accessible (single-process cudaDeviceEnablePeerAccess + raw pointers, OR
+//   The caller is responsible for making each rank's `payload`/`reduced` (5-launch) or
+//   `comm` (fused) buffers and barrier words peer-accessible (single-process cudaDeviceEnablePeerAccess + raw pointers, OR
 //   multi-process cudaIpcGetMemHandle/OpenMemHandle exchange). `peer_payloads[i]` /
 //   `peer_reduced[i]` must be device arrays (on the calling rank's device) of `world`
 //   pointers to every rank's payload / reduced buffer. `barrier_sig[i]` likewise points
@@ -45,7 +49,9 @@
 namespace nvfp4_ar {
 
 static constexpr int   SF_VEC_SIZE     = 16;   // values per UE4M3 block scale
-static constexpr int   ELTS_PER_THREAD = 8;    // 8 e2m1 = one uint32 per thread
+static constexpr int   ELTS_PER_THREAD = 8;    // quantize kernel: 8 e2m1 = one uint32 per thread
+static constexpr int   EPT32           = 32;   // RS/AG/fused: 32 e2m1 = one 16-byte load + 2 scale bytes
+static constexpr int   MAX_BLOCKS      = 2048; // fused kernel grid cap (barrier words scale with it)
 static constexpr int   MAX_RANKS       = 8;
 static constexpr float E2M1_MAX        = 6.0f;
 
@@ -145,50 +151,71 @@ __global__ void quantize_kernel(const __nv_bfloat16* __restrict__ in, uint8_t* _
     if (tid==0) *L.gscale(ob) = SF;
 }
 
-// Reduce-scatter: reduce this rank's shard across all peers, requantize once into `my`
-// (a SEPARATE reduced buffer — never overwrite the input payload in place).
-// `SFScaleReduced` should be SFScaleVal/world (the sum spans ~world x the input amax).
-__global__ void reducescatter_kernel(uint8_t** peer, uint8_t* my, Layout L, int world, int rank, size_t shard, float SFr) {
-    const size_t lt = size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-    if (lt >= shard/ELTS_PER_THREAD) return;
-    const size_t g = size_t(rank)*shard + lt*ELTS_PER_THREAD, po = g/2, si = g/SF_VEC_SIZE; float acc[8];
-#pragma unroll
-    for (int i=0;i<8;i++) acc[i]=0;
-    for (int r=0;r<world;r++){ uint8_t* b=peer[r]; uint32_t e=*reinterpret_cast<const uint32_t*>(&L.packed(b)[po]);
-        float bs=ue4m3_to_float(L.scales(b)[si])*recip_ftz(*L.gscale(b));
-#pragma unroll
-        float dq[8]; decode8_e2m1(e,dq);
-        for (int i=0;i<8;i++) acc[i]+=dq[i]*bs; }
+// ---- 16-byte helpers shared by the split and fused paths ----
+union Packed16 { int4 packed; __nv_bfloat162 unpacked[4]; };
+// quantize 16 floats -> 2 x uint32 e2m1 nibbles + one UE4M3 block scale (scale = SF*amax/6)
+__device__ __forceinline__ void q16(const float* v, float SF, uint32_t* ow, uint8_t& sfb){
     float mx=0;
 #pragma unroll
-    for (int i=0;i<8;i++) mx=fmaxf(mx,fabsf(acc[i]));
-    mx = fmaxf(__shfl_xor_sync(0xffffffffu, mx, 1), mx);
-    float SFv=SFr*(mx*recip_ftz(E2M1_MAX)); __nv_fp8_e4m3 sf=__nv_fp8_e4m3(SFv); float SFq=(float)sf;
-    float os=(mx!=0)?recip_ftz(SFq*recip_ftz(SFr)):0;
-    float sv[8];
+    for(int i=0;i<16;i++) mx=fmaxf(mx,fabsf(v[i]));
+    float SFv=SF*(mx*recip_ftz(E2M1_MAX)); __nv_fp8_e4m3 sf=__nv_fp8_e4m3(SFv); float SFq=(float)sf;
+    float os=(mx!=0)?recip_ftz(SFq*recip_ftz(SF)):0; sfb=sf.__x;
 #pragma unroll
-    for (int i=0;i<8;i++) sv[i]=acc[i]*os;
-    uint32_t e=encode8_e2m1(sv);
-    *reinterpret_cast<uint32_t*>(&L.packed(my)[po]) = e;
-    if ((lt&1)==0) L.scales(my)[si] = sf.__x;
+    for(int q=0;q<2;q++){ float sv[8];
+#pragma unroll
+        for(int i=0;i<8;i++) sv[i]=v[q*8+i]*os;
+        ow[q]=encode8_e2m1(sv); }
+}
+// dequantize 32 e2m1 (16 B) with 2 block scales, accumulate into acc[32]
+__device__ __forceinline__ void dq32_acc(uint4 e, uint16_t s2, float invSF, float* acc){
+    float bs0=ue4m3_to_float(uint8_t(s2&0xFF))*invSF, bs1=ue4m3_to_float(uint8_t(s2>>8))*invSF;
+    uint32_t w[4]={e.x,e.y,e.z,e.w};
+#pragma unroll
+    for(int q=0;q<4;q++){ float dq[8]; decode8_e2m1(w[q],dq); float bs=(q<2)?bs0:bs1;
+#pragma unroll
+        for(int i=0;i<8;i++) acc[q*8+i]+=dq[i]*bs; }
+}
+
+// Reduce-scatter (split path): reduce this rank's shard across all peers, requantize once into `my`.
+// Peer order is rotated by rank; each peer read is one 16-byte load + one 2-byte scale load.
+__global__ void reducescatter_kernel(uint8_t** peer, uint8_t* my, Layout L, int world, int rank, size_t shard, float SFr) {
+    const size_t lt = size_t(blockIdx.x)*blockDim.x+threadIdx.x;
+    if (lt >= shard/EPT32) return;
+    const size_t g = size_t(rank)*shard + lt*EPT32, po = g/2, si = g/SF_VEC_SIZE; float acc[32];
+#pragma unroll
+    for (int i=0;i<32;i++) acc[i]=0;
+    for (int ii=0;ii<world;ii++){ int r=(rank+ii)%world; uint8_t* b=peer[r];
+        uint4 e=*reinterpret_cast<const uint4*>(&L.packed(b)[po]);
+        uint16_t s2=*reinterpret_cast<const uint16_t*>(&L.scales(b)[si]);
+        dq32_acc(e,s2,recip_ftz(*L.gscale(b)),acc); }
+    uint32_t ow[4]; uint8_t sfb[2];
+    q16(acc,SFr,ow,sfb[0]); q16(acc+16,SFr,ow+2,sfb[1]);
+    *reinterpret_cast<uint4*>(&L.packed(my)[po]) = make_uint4(ow[0],ow[1],ow[2],ow[3]);
+    *reinterpret_cast<uint16_t*>(&L.scales(my)[si]) = uint16_t(sfb[0])|(uint16_t(sfb[1])<<8);
     if (lt==0) *L.gscale(my) = SFr;
 }
 
-// All-gather: pull each shard's reduced NVFP4 result from its owner -> BF16 output.
-__global__ void allgather_kernel(uint8_t** peer_reduced, __nv_bfloat16* __restrict__ out, Layout L, int world, size_t shard) {
+// All-gather (split path): pull each shard's reduced NVFP4 result from its owner -> BF16 output.
+// Owner sequence rotated by rank so concurrent readers spread over all owners.
+__global__ void allgather_kernel(uint8_t** peer_reduced, __nv_bfloat16* __restrict__ out, Layout L, int world, size_t shard, int rank) {
     const size_t tid = size_t(blockIdx.x)*blockDim.x+threadIdx.x;
-    if (tid >= L.numel/ELTS_PER_THREAD) return;
-    const size_t g = tid*ELTS_PER_THREAD; const int owner = int(g/shard); uint8_t* b = peer_reduced[owner];
-    const size_t po=g/2, si=g/SF_VEC_SIZE; uint32_t e=*reinterpret_cast<const uint32_t*>(&L.packed(b)[po]);
-    float bs=ue4m3_to_float(L.scales(b)[si])*recip_ftz(*L.gscale(b));
+    if (tid >= L.numel/EPT32) return;
+    const size_t tps=shard/EPT32; const int slot=int(tid/tps); const int owner=(slot+rank)%world;
+    const size_t g=size_t(owner)*shard+(tid-size_t(slot)*tps)*EPT32; uint8_t* b=peer_reduced[owner];
+    uint4 e=*reinterpret_cast<const uint4*>(&L.packed(b)[g/2]);
+    uint16_t s2=*reinterpret_cast<const uint16_t*>(&L.scales(b)[g/SF_VEC_SIZE]);
+    float acc[32];
 #pragma unroll
-    float dq[8]; decode8_e2m1(e,dq);
+    for(int i=0;i<32;i++) acc[i]=0.f;
+    dq32_acc(e,s2,recip_ftz(*L.gscale(b)),acc);
 #pragma unroll
-    for (int i=0;i<8;i++) out[g+i]=__float2bfloat16(dq[i]*bs);
+    for(int k=0;k<4;k++){ Packed16 pk;
+#pragma unroll
+        for(int j=0;j<4;j++) pk.unpacked[j]=__floats2bfloat162_rn(acc[k*8+2*j],acc[k*8+2*j+1]);
+        *reinterpret_cast<int4*>(&out[g+k*8])=pk.packed; }
 }
 
-// All-to-all counter barrier (TRT-LLM multi_gpu_barrier pattern). Use a MONOTONIC
-// increasing `flag` per call so stale values never false-pass.
+// All-to-all counter barrier (split path). Use a MONOTONIC increasing `flag` per call.
 __global__ void barrier_kernel(uint64_t** sig, int rank, int world, uint64_t flag) {
     int t = threadIdx.x;
     if (blockIdx.x==0 && t<world) {
@@ -198,24 +225,137 @@ __global__ void barrier_kernel(uint64_t** sig, int rank, int world, uint64_t fla
     __syncthreads();
 }
 
+// ---- fused path: TRT-LLM block_barrier (flag parity ping-pong, per-block offset) ----
+__device__ __forceinline__ void st_flag_release(uint32_t flag, uint32_t* addr){ asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr)); }
+__device__ __forceinline__ uint32_t ld_flag_acquire(uint32_t* addr){ uint32_t f; asm volatile("ld.global.acquire.sys.b32 %0, [%1];" : "=r"(f) : "l"(addr)); return f; }
+__device__ __forceinline__ void block_barrier(uint32_t** signals, uint32_t flag, int local_rank, int world, int tidx, int bidx){
+    if (tidx < world) {
+        uint32_t off = (bidx + 1) * world;
+        if (flag % 2 == 1) off += (MAX_BLOCKS + 1) * world;
+        st_flag_release(flag, signals[tidx] + off + local_rank);
+        uint32_t* peer = signals[local_rank] + off + tidx;
+        while (ld_flag_acquire(peer) != flag) {}
+    }
+    __syncthreads();
+}
+// barrier words per rank for the fused kernel (two arrays: in / out)
+__host__ __device__ constexpr size_t fused_barrier_words(int world){ return size_t(2)*(MAX_BLOCKS+1)*world + 8; }
+// comm buffer per rank for the fused kernel: [2*world columns][slot_bytes]
+__host__ __device__ inline size_t fused_slot_bytes(size_t shard){ return ((shard/2 + shard/SF_VEC_SIZE) + 15) & ~size_t(15); }
+__host__ __device__ inline size_t fused_comm_bytes(size_t shard, int world){ return size_t(2)*world*fused_slot_bytes(shard); }
+
+// Fused two-shot, TRT-LLM twoShotAllReduceKernel structure with NVFP4 payload:
+//  1. quantize my copy of shard ranks[ii] and PUSH it (16 B + 2 B) into owner's buffer, column local_rank
+//  2. block_barrier
+//  3. reduce my shard across the world columns of MY buffer (local reads), requantize into column 0
+//  4. block_barrier
+//  5. pull every owner's column 0, dequantize -> BF16 output
+// Columns are [flag parity]*world + col, so consecutive calls never overwrite each other.
+template <int RANKS>
+__global__ void twoshot_fused_kernel(
+    const __nv_bfloat16* __restrict__ local_input, __nv_bfloat16* __restrict__ local_output,
+    uint8_t** comm_bufs, uint32_t** barrier_in, uint32_t** barrier_out,
+    int local_rank, size_t elts_per_rank, size_t slot_bytes, size_t elts_per_block, float SF, float SFr, uint32_t flag)
+{
+    const int bidx=blockIdx.x, tidx=threadIdx.x;
+    const int buffer_offset=(flag%2==0)?0:RANKS;
+    const size_t packed_bytes=elts_per_rank/2;
+    uint8_t* local_shared=comm_bufs[local_rank];
+    uint8_t* buffers[RANKS]; int ranks[RANKS];
+#pragma unroll
+    for(int ii=0;ii<RANKS;ii++){ int rank=(local_rank+ii)%RANKS; ranks[ii]=rank; buffers[ii]=comm_bufs[rank]; }
+    const size_t chunk_start=bidx*elts_per_block+tidx*EPT32;
+    const size_t chunk_end=min(chunk_start+elts_per_block, elts_per_rank);
+    const float invSF=recip_ftz(SF), invSFr=recip_ftz(SFr);
+
+    for(size_t lo=chunk_start; lo<chunk_end; lo+=blockDim.x*EPT32){
+#pragma unroll
+        for(int ii=0;ii<RANKS;ii++){
+            const __nv_bfloat16* src=local_input+(size_t)ranks[ii]*elts_per_rank+lo;
+            float v[32];
+#pragma unroll
+            for(int k=0;k<4;k++){ Packed16 pk; pk.packed=*reinterpret_cast<const int4*>(src+k*8);
+#pragma unroll
+                for(int j=0;j<4;j++){ float2 f=__bfloat1622float2(pk.unpacked[j]); v[k*8+2*j]=f.x; v[k*8+2*j+1]=f.y; } }
+            uint32_t ow[4]; uint8_t sfb[2];
+            q16(v,SF,ow,sfb[0]); q16(v+16,SF,ow+2,sfb[1]);
+            uint8_t* slot=buffers[ii]+(size_t)(buffer_offset+local_rank)*slot_bytes;
+            *reinterpret_cast<uint4*>(slot+lo/2)=make_uint4(ow[0],ow[1],ow[2],ow[3]);
+            *reinterpret_cast<uint16_t*>(slot+packed_bytes+lo/SF_VEC_SIZE)=uint16_t(sfb[0])|(uint16_t(sfb[1])<<8);
+        }
+    }
+    block_barrier(barrier_in, flag, local_rank, RANKS, tidx, bidx);
+    for(size_t lo=chunk_start; lo<chunk_end; lo+=blockDim.x*EPT32){
+        float acc[32];
+#pragma unroll
+        for(int i=0;i<32;i++) acc[i]=0.f;
+#pragma unroll
+        for(int rank=0;rank<RANKS;rank++){ int ii=(rank+RANKS-local_rank)%RANKS;
+            const uint8_t* slot=local_shared+(size_t)(buffer_offset+ii)*slot_bytes;
+            uint4 e=*reinterpret_cast<const uint4*>(slot+lo/2);
+            uint16_t s2=*reinterpret_cast<const uint16_t*>(slot+packed_bytes+lo/SF_VEC_SIZE);
+            dq32_acc(e,s2,invSF,acc); }
+        uint32_t ow[4]; uint8_t sfb[2];
+        q16(acc,SFr,ow,sfb[0]); q16(acc+16,SFr,ow+2,sfb[1]);
+        uint8_t* slot=local_shared+(size_t)buffer_offset*slot_bytes;
+        *reinterpret_cast<uint4*>(slot+lo/2)=make_uint4(ow[0],ow[1],ow[2],ow[3]);
+        *reinterpret_cast<uint16_t*>(slot+packed_bytes+lo/SF_VEC_SIZE)=uint16_t(sfb[0])|(uint16_t(sfb[1])<<8);
+    }
+    block_barrier(barrier_out, flag, local_rank, RANKS, tidx, bidx);
+    for(size_t lo=chunk_start; lo<chunk_end; lo+=blockDim.x*EPT32){
+#pragma unroll
+        for(int ii=0;ii<RANKS;ii++){
+            const uint8_t* slot=buffers[ii]+(size_t)buffer_offset*slot_bytes;
+            uint4 e=*reinterpret_cast<const uint4*>(slot+lo/2);
+            uint16_t s2=*reinterpret_cast<const uint16_t*>(slot+packed_bytes+lo/SF_VEC_SIZE);
+            float acc[32];
+#pragma unroll
+            for(int i=0;i<32;i++) acc[i]=0.f;
+            dq32_acc(e,s2,invSFr,acc);
+            __nv_bfloat16* dst=local_output+(size_t)ranks[ii]*elts_per_rank+lo;
+#pragma unroll
+            for(int k=0;k<4;k++){ Packed16 pk;
+#pragma unroll
+                for(int j=0;j<4;j++) pk.unpacked[j]=__floats2bfloat162_rn(acc[k*8+2*j],acc[k*8+2*j+1]);
+                *reinterpret_cast<int4*>(dst+k*8)=pk.packed; }
+        }
+    }
+}
+
 // -----------------------------------------------------------------------------
-// Host launcher for ONE rank's two-shot NVFP4 all-reduce (call once per rank/device;
-// the caller sets the device and drives the cross-rank barrier ordering via `flag`).
-// Precondition: caller already cudaSetDevice(rank).
-//   input           : BF16 [numel] on this device
-//   output          : BF16 [numel] on this device
-//   payload         : this rank's NVFP4 payload buffer (Layout::total_bytes), peer-visible
-//   reduced         : this rank's reduced-shard NVFP4 buffer (Layout::total_bytes), peer-visible
-//   peer_payloads   : device array[world] of every rank's payload pointer
-//   peer_reduced    : device array[world] of every rank's reduced pointer
-//   barrier_sig     : device array[world] of every rank's uint64 barrier buffer
-//   SFScaleVal      : per-tensor global scale ((E2M1_MAX*448)/amax)
-//   flag            : monotonic barrier flag base; this call consumes flag and flag+1
-//   stream          : CUDA stream
-// numel must satisfy numel % (world*SF_VEC_SIZE) == 0.
-// NOTE: correct cross-rank execution requires all `world` ranks to be launched before
-// any barrier completes (launch all, then sync) — same as TRT-LLM's model.
+// Host launchers. Precondition: caller already cudaSetDevice(rank); launch ALL `world` ranks
+// before synchronizing any of them (the in-kernel barriers need every rank in flight).
+// numel must satisfy numel % (world*EPT32) == 0.
+//
+// launch_fused_rank (recommended, one kernel):
+//   comm          : this rank's buffer of fused_comm_bytes(shard, world) bytes, peer-visible
+//   peer_comm     : device array[world] of every rank's comm pointer
+//   barrier_in/out: device arrays[world] of every rank's uint32 barrier buffer,
+//                   fused_barrier_words(world) words each, zero-initialized once
+//   flag          : MONOTONIC uint32, +1 per call (parity selects the comm column set)
+//   grid          : blocks (<= MAX_BLOCKS); 0 = ~4 chunks/thread, clamped to [16, MAX_BLOCKS]
 // -----------------------------------------------------------------------------
+template <int RANKS>
+inline void launch_fused_rank(
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    uint8_t** peer_comm, uint32_t** barrier_in, uint32_t** barrier_out,
+    int rank, size_t numel, float SFScaleVal, uint32_t flag,
+    cudaStream_t stream = 0, int TPB = 256, int grid = 0)
+{
+    const size_t shard = numel / RANKS;
+    const size_t slot  = fused_slot_bytes(shard);
+    const float  SFr   = SFScaleVal / float(RANKS);
+    if (grid <= 0) {   // default: ~4 chunks per thread, clamped to [16, MAX_BLOCKS] (from the B200 grid sweep in README)
+        size_t g = (shard + size_t(TPB)*EPT32*4 - 1) / (size_t(TPB)*EPT32*4);
+        if (g < 16) g = 16; if (g > size_t(MAX_BLOCKS)) g = MAX_BLOCKS; grid = int(g); }
+    const size_t epb = ((shard + size_t(grid)*TPB*EPT32 - 1) / (size_t(grid)*TPB*EPT32)) * (size_t(TPB)*EPT32);
+    twoshot_fused_kernel<RANKS><<<grid, TPB, 0, stream>>>(input, output, peer_comm, barrier_in, barrier_out,
+                                                         rank, shard, slot, epb, SFScaleVal, SFr, flag);
+}
+
+// launch_twoshot_rank (split path, five launches; `flag` consumes flag and flag+1):
+//   payload/reduced : this rank's NVFP4 buffers (Layout::total_bytes each), peer-visible
+//   peer_payloads / peer_reduced / barrier_sig : device arrays[world] of every rank's pointers
 inline void launch_twoshot_rank(
     const __nv_bfloat16* input, __nv_bfloat16* output,
     uint8_t* payload, uint8_t* reduced,
@@ -226,14 +366,15 @@ inline void launch_twoshot_rank(
     Layout L = Layout::make(numel);
     const size_t shard = numel / world;
     const float  SFr   = SFScaleVal / float(world);
-    const int grid   = int((numel/ELTS_PER_THREAD + TPB - 1) / TPB);
-    const int grid_s = int((shard/ELTS_PER_THREAD + TPB - 1) / TPB);
+    const int grid    = int((numel/ELTS_PER_THREAD + TPB - 1) / TPB);
+    const int grid_s  = int((shard/EPT32 + TPB - 1) / TPB);
+    const int grid_ag = int((numel/EPT32 + TPB - 1) / TPB);
 
-    quantize_kernel     <<<grid,   TPB, 0, stream>>>(input, payload, L, SFScaleVal);
+    quantize_kernel     <<<grid,    TPB, 0, stream>>>(input, payload, L, SFScaleVal);
     barrier_kernel      <<<1, MAX_RANKS, 0, stream>>>(barrier_sig, rank, world, flag);
-    reducescatter_kernel<<<grid_s, TPB, 0, stream>>>(peer_payloads, reduced, L, world, rank, shard, SFr);
+    reducescatter_kernel<<<grid_s,  TPB, 0, stream>>>(peer_payloads, reduced, L, world, rank, shard, SFr);
     barrier_kernel      <<<1, MAX_RANKS, 0, stream>>>(barrier_sig, rank, world, flag + 1);
-    allgather_kernel    <<<grid,   TPB, 0, stream>>>(peer_reduced, output, L, world, shard);
+    allgather_kernel    <<<grid_ag, TPB, 0, stream>>>(peer_reduced, output, L, world, shard, rank);
 }
 
 } // namespace nvfp4_ar
