@@ -9,7 +9,7 @@
 ada/       sm_89        (L40S / RTX 40)
 hopper/    sm_90a       (H100 / H20)
 blackwell/ sm_100a+120a (B200 / RTX 6000D)
-  blackwell/allreduce/  NVFP4 all-reduce vs TRT-LLM BF16/FP8 custom AR (5 GPUs, PCIe+NVLink, full run recipes + results)
+  blackwell/allreduce/  NVFP4 all-reduce vs TRT-LLM BF16/FP8 custom AR (5 Blackwell GPU types, 8 GPUs each, PCIe+NVLink incl. 2-node GB300, recipes + results)
 ```
 
 ---

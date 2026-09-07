@@ -24,15 +24,15 @@ blackwell/allreduce/
 | RTX 6000D (cc 12.0) | sm_120 | 8 | PCIe | CUDA 13.3 nvcc, local | `nvidia-smi -lgc <max>` → ~2.35 GHz |
 | RTX PRO 6000 Blackwell Server Edition | sm_120 | 8 | PCIe | static binary (`-cudart static`) built with CUDA 13.3 on an x86 host; no toolkit on the node | slurm `--gpu-freq=high` → **2422 MHz** |
 | B200 (cc 10.0) | sm_100 | 8 | NVLink | static binary built with CUDA 13.3 on an x86 host | slurm `--gpu-freq=1965` → **1965 MHz** |
-| GB300 (cc 10.3, aarch64) | sm_103 | **4** (4 GPU/node) | NVLink | built inside the container `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc13` (CUDA 13.1, aarch64); no toolkit on the node | slurm `--gpu-freq=high` → **2070 MHz** |
+| GB300 NVL72 (cc 10.3, aarch64) | sm_103 | 8 = **2 nodes × 4 GPUs** (multi-process harness `bench_ar_mp.cu`, fabric handles + IMEX) | NVLink (intra-rack, cross-node) | built inside the container `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc13` (CUDA 13.1, aarch64); no toolkit on the node | slurm `--gpu-freq=high` requested (slurm reported `GpuFreq=control_disabled` on the 2-node jobs); `nvidia-smi` read back **2070 MHz** (= GB300 max SM clock) after every run |
 | RTX PRO 5000 Blackwell 72GB (early data only) | sm_120 | 8 | PCIe, 2 NUMA (0–3 / 4–7, cross = SYS) | CUDA 13.0 nvcc, local | `-lgc` → ~2.6 GHz (power-capped, not pinned) |
 
-- Harness: single process, `cudaDeviceEnablePeerAccess` + raw peer pointers (no NCCL, no MPI).
+- Harness: `bench_ar.cu` — single process, `cudaDeviceEnablePeerAccess` + raw peer pointers (no NCCL, no MPI). `bench_ar_mp.cu` — same kernels, one process per node (slurm `SLURM_PROCID`/`SLURM_NTASKS`), buffers allocated with `cuMemCreate(CU_MEM_HANDLE_TYPE_FABRIC)` and exchanged as fabric handles through files on the shared `$HOME`; peers on the other node are mapped with `cuMemImportFromShareableHandle` + `cuMemMap`. Requires IMEX (`/dev/nvidia-caps-imex-channels`) and both nodes in the same NVL72 domain. Used for the 8-GPU GB300 numbers.
 - Timing: CUDA events on rank 0; 20 warm-up + 100 timed iterations (5 + 20 for ≥128M elements). Numbers are µs per all-reduce.
 - Clocks were read back with `nvidia-smi --query-gpu=clocks.sm` after every run; the MHz above are those readings.
 - Accuracy: rel_rmse vs an FP32 host reference of the same random inputs (fixed seed).
 - Driver versions were not recorded.
-- GB300 nodes have 4 GPUs; an 8-GPU GB300 run would need a multi-process (IMEX/fabric-handle) harness, which this single-process code is not.
+- GB300 nodes have 4 GPUs, so the 8-GPU GB300 run spans two nodes of one NVL72 rack; all ranks still talk over NVLink (no network), but rank 0's timing loop synchronises 8 GPUs across two hosts, so absolute numbers are not directly comparable with the single-host B200 table. The run was repeated on a second GB300 NVL72 rack (different site); every number agreed within 1 %.
 
 ## 2. What is being compared
 
@@ -90,7 +90,8 @@ nvcc -gencode arch=compute_120a,code=sm_120a -O3 -std=c++17 bench_ar.cu -o bench
 nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -cudart static bench_ar.cu -o bench_ar_b200
 
 # GB300 (sm_103, 4 GPUs/node, aarch64 — must be compiled ON an aarch64 host/container)
-nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -DNRANKS=4 bench_ar.cu -o bench_ar_gb300
+nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -DNRANKS=4 bench_ar.cu -o bench_ar_gb300        # single node, 4 GPUs
+nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -DNRANKS=8 bench_ar_mp.cu -o bench_ar_mp -lcuda # 2 nodes x 4 GPUs
 ```
 
 `NRANKS` (default 8) must equal the number of visible GPUs. A cross-compiled sm_100a static binary
@@ -160,19 +161,34 @@ ssh <slurm-login> "srun -A <account> --qos <qos> \
    nvidia-smi --query-gpu=clocks.sm --format=csv,noheader | head -1'"
 ```
 
-**D. GB300 node (4 GPUs/node, aarch64) — compile inside a CUDA container**
+**D. GB300, 8 GPUs = 2 nodes × 4 (aarch64) — multi-process harness, compile inside a CUDA container**
 ```bash
-scp bench_ar.cu <slurm-login>:~/nvfp4_allreduce/
-ssh <slurm-login> "srun -A <account> -p <partition> --gres=gpu:GB300:4 --gpu-freq=high -t 1:30:0 \
-   --container-image=nvcr.io#nvidia/tensorrt-llm/release:1.3.0rc13 --container-mounts=\$HOME/nvfp4_allreduce:/work \
-   bash -lc '
-   cd /work
-   /usr/local/cuda/bin/nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -DNRANKS=4 bench_ar.cu -o bench_ar_gb300
-   for N in 33554432 134217728 536870912 2147483648; do echo NUMEL=\$N; stdbuf -oL timeout 2400 ./bench_ar_gb300 \$N; done
-   nvidia-smi --query-gpu=clocks.sm --format=csv,noheader | head -1'"
+scp bench_ar_mp.cu <slurm-login>:~/nvfp4_allreduce/
+# sbatch script (two nodes in ONE NVL72 domain; --switches=1 does that on block-topology clusters,
+# otherwise pin --nodelist to two nodes of the same rack):
+cat > gb300_mp.sbatch <<'EOF'
+#!/bin/bash
+#SBATCH -A <account> -p <partition> -N 2 --ntasks-per-node=1 --gres=gpu:4 --switches=1 -t 0:45:00
+#SBATCH -o nvfp4_mp8_%j.out -e nvfp4_mp8_%j.err
+srun --gpu-freq=high \
+  --container-image=nvcr.io#nvidia/tensorrt-llm/release:1.3.0rc13 --container-mounts=$HOME/nvfp4_allreduce:/work \
+  bash -c '
+cd /work
+ls /dev/nvidia-caps-imex-channels >/dev/null 2>&1 && echo IMEX_OK || echo NO_IMEX
+if [ "$SLURM_PROCID" = 0 ]; then
+  /usr/local/cuda/bin/nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -DNRANKS=8 bench_ar_mp.cu -o bench_ar_mp -lcuda
+  touch /work/.built_$SLURM_JOB_ID
+fi
+while [ ! -f /work/.built_$SLURM_JOB_ID ]; do sleep 2; done
+for N in 33554432 134217728 536870912 2147483648; do echo NUMEL=$N; stdbuf -oL timeout 600 ./bench_ar_mp $N; done
+nvidia-smi --query-gpu=clocks.sm --format=csv,noheader | head -1'
+EOF
+sbatch gb300_mp.sbatch
 ```
-The GB300 node has no `nvcc`; `--gpu-freq=high` set at the host level is honoured inside the
-container (`nvidia-smi -lgc` inside the container is refused).
+`bench_ar_mp` derives `world = SLURM_NTASKS × visible GPUs` and requires it to equal `NRANKS`, so
+4 nodes × `--gres=gpu:2` also works. Handle exchange goes through `/work/hs_<jobid>_<numel>/rank<r>.bin`
+on the shared mount; process 0 checks correctness and prints the table. The GB300 node has no `nvcc`.
+The single-node 4-GPU variant is `bench_ar.cu` with `-DNRANKS=4` under `srun --gres=gpu:4` in the same container.
 
 ### 3.4 Using the standalone kernel
 
@@ -227,22 +243,28 @@ the baseline.
 One-shot, B200: 32M BF16 1742 / myFP8 456 / **NVFP4 280** (6.2× / 1.63×); 512M 27737 / 6593 / **3846**
 (7.2× / 1.71× ≈ byte ratio 1.89×); 2G 111023 / 26270 / **15310**. (TRT-LLM has no FP8 one-shot.)
 
-### 4.4 NVLink — GB300, 4 GPUs/node, sm_103, locked 2070 MHz (µs), two-shot
+### 4.4 NVLink — GB300 NVL72, 8 GPUs = 2 nodes × 4, sm_103, 2070 MHz (µs), two-shot
 
-| numel | BF16 | TRT-FP8 grid 16 (verbatim) | **TRT-FP8 grid scaled** | myFP8 | NVFP4 | NVFP4/BF16 | NVFP4/TRT-FP8₁₆ | **NVFP4/TRT-FP8ₛ** |
-|---:|---:|---:|---:|---:|---:|:--:|:--:|:--:|
-| 32M | 591 | 684 | **186** (g=1058) | 207 | **164** | 3.60× | 4.14× | **1.13×** |
-| 128M | 2480 | 2664 | **546** (g=2048) | 705 | **524** | 4.73× | 5.07× | **1.04×** |
-| 512M | 9851 | 10499 | **1707** (g=2048) | 2648 | 1944 | 5.07× | 5.39× | **0.88×** |
-| 2G | 40136 | 41846 | **6359** (g=2048) | 10419 | 7663 | 5.24× | 5.46× | **0.83×** |
+`bench_ar_mp`, TRT-FP8 grid scaled (`g` = blocks × 512 threads). Accuracy unchanged: BF16 0.0040, TRT-FP8 0.0367, NVFP4 0.1398 rel_rmse.
 
-One-shot, GB300: 32M BF16 810 / myFP8 210 / **NVFP4 152**; 512M 12876 / 2966 / **1980**; 2G 51588 / 11809 / **7923**.
+| numel | BF16 | **TRT-FP8 (verbatim, grid scaled)** | myFP8 | NVFP4 | NVFP4/BF16 | **NVFP4/TRT-FP8** |
+|---:|---:|---:|---:|---:|:--:|:--:|
+| 32M | 663 | **173** (g=529) | 265 | 205 | 3.23× | **0.84×** |
+| 128M | 2726 | **568** (g=2048) | 960 | 671 | 4.06× | **0.85×** |
+| 512M | 10899 | **1808** (g=2048) | 4046 | 2585 | 4.22× | **0.70×** |
+| 2G | 45609 | **7019** (g=2048) | 16098 | 10097 | 4.52× | **0.70×** |
+
+One-shot, GB300 8 GPUs (BF16 / myFP8 / **NVFP4**): 32M 1719 / 465 / **276**; 128M 6857 / 1693 / **989**;
+512M 27452 / 6584 / **3833**; 2G 109706 / 26175 / **15240** (NVFP4/FP8 one-shot 1.69–1.72× at every size; TRT-LLM has no FP8 one-shot).
+
+Earlier single-node 4-GPU GB300 run (`bench_ar.cu`, `-DNRANKS=4`), two-shot NVFP4/TRT-FP8ₛ: 32M 1.13×, 128M 1.04×,
+512M 0.88×, 2G 0.83× — the 4-rank case has half the reduce-scatter fan-in and flattered NVFP4; the 8-GPU
+numbers above supersede it.
 
 **Reading the NVLink tables.** With its verbatim 16-block dispatch TRT-FP8 is occupancy-starved
 on NVLink (16 × 512 threads cannot drive ~900 GB/s) and runs at BF16 speed — off-design, so the
-`NVFP4/TRT-FP8₁₆` column (2.8–5.5×) must not be quoted. At fair occupancy TRT-LLM's FP8 kernel
-**beats NVFP4 on B200 at every size (NVFP4 17–31 % slower)** and roughly ties on GB300
-(+13 % … −17 %).
+B200 `NVFP4/TRT-FP8₁₆` column (2.8–5.5×) must not be quoted. At fair occupancy TRT-LLM's FP8 kernel
+**beats NVFP4 on both B200 and GB300 at every size with 8 GPUs (NVFP4 15–31 % slower)**.
 
 ### 4.5 Codec ablation (what actually moved the numbers)
 
@@ -251,9 +273,9 @@ on NVLink (16 × 512 threads cannot drive ~900 GB/s) and runs at BF16 speed — 
 | B200 512M | v0 local-memory LUT decode + branchy encode | 19937 µs (0.33× vs myFP8) | 5996 µs (0.68×) |
 | B200 512M | v1 PRMT decode + hw encode | 3862 (1.71×) | 2671 (1.50×) |
 | B200 512M | v2 hw decode + hw encode | 3846 | 2672 |
-| GB300 2G | PRMT decode + software encode | — | 9059 |
-| GB300 2G | PRMT decode + hw encode | — | 7798 |
-| GB300 2G | hw decode + hw encode | — | 7662 |
+| GB300 2G (single node, 4 GPUs) | PRMT decode + software encode | — | 9059 |
+| GB300 2G (single node, 4 GPUs) | PRMT decode + hw encode | — | 7798 |
+| GB300 2G (single node, 4 GPUs) | hw decode + hw encode | — | 7662 |
 | 6000D 512K | PRMT decode | 3893 | 1111 |
 | 6000D 512K | hw decode (sm_120) | 5342 (**+37 %**) | 1258 (+13 %) |
 | 6000D 8M | PRMT decode / hw decode | 92471 / 85218 | 15645 / 18057 |
@@ -276,8 +298,8 @@ Included for completeness; superseded by §4.1–4.2 (fast codec, TRT-FP8 baseli
 
 ## 5. Conclusions
 
-1. **vs TRT-LLM BF16 custom AR: NVFP4 wins everywhere** — 1.7–2.8× on PCIe, 3–5× on NVLink (two-shot, large messages).
-2. **vs TRT-LLM's real FP8 kernel** — **wins 1.2–2.1× on PCIe**, **loses on NVLink**: B200 −17…−31 % at all sizes 32M–2G, GB300 +13 % … −17 %. Only the verbatim TRT-LLM FP8 kernel is a valid baseline; a per-16-scale re-implementation ran 1.6–2.3× slower than it on NVLink and would have made NVFP4 look 1.5× better than it is.
+1. **vs TRT-LLM BF16 custom AR: NVFP4 wins everywhere** — 1.7–2.8× on PCIe, 3.2–4.5× on NVLink with 8 GPUs (two-shot, large messages), 6–7× one-shot.
+2. **vs TRT-LLM's real FP8 kernel** — **wins 1.2–2.1× on PCIe**, **loses on NVLink**: B200 −17…−31 % and GB300 (2 nodes × 4) −15…−30 % at all sizes 32M–2G. Only the verbatim TRT-LLM FP8 kernel is a valid baseline; a per-16-scale re-implementation ran 1.6–2.3× slower than it on NVLink and would have made NVFP4 look 1.5× better than it is.
 3. **Why NVFP4 loses on NVLink despite moving 1.9× fewer bytes than FP8:** kernel structure, not format. This NVFP4 path is five launches (quantize, barrier, reduce-scatter, barrier, all-gather) with two separate barrier kernels and per-16 scales read on both legs; TRT-FP8 is one fused kernel with an in-kernel barrier, 16-element int4 loads and a per-496 in-stream scale. PCIe (~0.7 GB/s effective P2P) hides all of that; NVLink does not.
 4. **The codec is a precondition, not the differentiator.** A runtime-indexed table in local memory made NVFP4 compute-bound and lose to BF16 on NVLink; PRMT or hardware `cvt` (any register-only decode) restores the bandwidth-bound regime. Hardware E2M1 `cvt` exists on every Blackwell including sm_120 — build with explicit `-gencode …a`.
 5. Accuracy cost: rel_rmse 0.14 (NVFP4 two-shot) vs 0.037 (FP8).
