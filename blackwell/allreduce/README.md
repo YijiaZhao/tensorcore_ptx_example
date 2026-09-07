@@ -23,9 +23,9 @@ Headline (two-shot, 8 GPUs, clocks locked, µs; **fused NVFP4 vs TRT-LLM FP8**):
 
 | GPU | interconnect | 32M / 512K | 128M / 8M | 512M | 2G |
 |---|---|---|---|---|---|
-| B200 ×8 | NVLink | **1.49×** | **1.91×** | **1.80×** | **1.91×** |
-| GB300 2×4 (NVL72) | NVLink cross-node | **1.37×** | **1.78×** | **1.67×** | **1.78×** |
-| RTX 6000D ×8 (PCIe) | PCIe | **4.48×** (512K) | **2.72×** (8M) | — | — |
+| B200 ×8 | NVLink | **1.84×** | **1.91×** | **1.80×** | **1.91×** |
+| GB300 2×4 (NVL72) | NVLink cross-node | **1.73×** | **1.78×** | **1.67×** | **1.78×** |
+| RTX 6000D ×8 (PCIe) | PCIe | **3.23×** (32K) · **4.63×** (128K) · **4.48×** (512K) | **2.72×** (8M) | — | — |
 | RTX PRO 6000 ×8 (PCIe) | PCIe | see §4.2 | see §4.2 | — | — |
 
 vs TRT-LLM BF16 custom AR the fused NVFP4 kernel is 5.5–11.8× faster on NVLink and 3.7–4.6× on PCIe.
@@ -89,8 +89,9 @@ Wire format per rank: `numel/2` bytes of packed E2M1 + `numel/16` bytes of UE4M3
 5. pull each owner's column 0 (rotated order), dequantize, write 64 B of BF16 output per peer.
 
 Comm buffer per rank: `[2·RANKS columns][shard/2 + shard/16 bytes]`; flag parity selects the
-column set so back-to-back calls never overwrite each other (same trick as TRT-LLM). Grid default:
-~4 chunks of `TPB·32` elements per thread, clamped to [16, 2048] (see the sweep in §4.5).
+column set so back-to-back calls never overwrite each other (same trick as TRT-LLM). Grid default
+(NVLink, from the sweep in §4.5): one `TPB·32`-element chunk per block up to 256 blocks, then 4 chunks
+per thread up to 2048; floor 16. On PCIe pass `grid=4…8` (`NV_GRID=8` / `NV_PCIE=1` in the bench).
 
 **Split path** (`launch_twoshot_rank`, 5 launches): quantize | counter-barrier | reduce-scatter
 (PULL: read every peer's shard slice, rotated order, 16 B loads) | counter-barrier | all-gather
@@ -256,14 +257,24 @@ unless marked.
 
 | numel | shape | TRT-BF16 | TRT-FP8 | myFP8 | NVFP4 split | **NVFP4 fused** | fused/BF16 | **fused/TRT-FP8** | split/TRT-FP8 |
 |---:|---|---:|---:|---:|---:|---:|:--:|:--:|:--:|
+| 32K | two-shot | 108 | 226 (g16) | 127 | 79 | **70** (g16) | 1.5× | **3.23×** | 2.86× |
+| 32K | two-shot, `NV_GRID=4` | | | | | **38** | 2.5× | **5.96×** | |
+| 128K | two-shot | 427 | 657 (g16) | 453 | 228 | **142** (g16) | 3.0× | **4.63×** | 2.88× |
+| 128K | two-shot, `NV_GRID=4` | | | | | **96** | 4.6× | **6.82×** | |
 | 512K | two-shot | 2147 | 2097 (g16) | 1884 | 900 | **467** (g16) | 4.6× | **4.48×** | 2.33× |
+| 512K | two-shot, `NV_GRID=4` | | | | | **399** | 5.3× | **5.24×** | |
 | 8M | two-shot | 49800 | 36916 (g133) | 23265 | 20264 | **13561** (g32) | 3.7× | **2.72×** | 1.82× |
 | 8M | two-shot, `NV_GRID=8` | | | | | **9937** | 5.0× | **3.73×** | |
+| 32K | one-shot | 578 | — | 241 | **143** | | 4.0× | 1.7× vs myFP8 | |
+| 128K | one-shot | 2341 | — | 1889 | **857** | | 2.7× | 2.2× vs myFP8 | |
 | 512K | one-shot | 9848 | — | 10319 | **3772** | | 2.6× | 2.7× vs myFP8 | |
 | 8M | one-shot | 158205 | — | 166730 | **92070** | | 1.7× | 1.8× vs myFP8 | |
 
-Fused grid on PCIe (8M): 8 blocks 9937 · 32 blocks 13600 · 128 blocks 14479 µs — PCIe wants few
-blocks, exactly TRT-LLM's PCIe design point (16). Split-path phases at 8M: RS 10289 / AG 9446 µs; the
+Fused grid on PCIe: 8M — 8 blocks 9937 · 32 blocks 13600 · 128 blocks 14479 µs; 512K — 4 blocks 399 ·
+8 blocks 465 · 16 blocks 493; 32K — 4 blocks 38 · 8 blocks 47 · 16 blocks 67. PCIe wants very few
+blocks (4–8), fewer even than TRT-LLM's PCIe design point of 16; the default clamp of 16 is the
+conservative choice, pass `NV_GRID`/`grid` for the last 1.3–1.8×. Below 512K TRT-LLM's FP8 kernel is
+slower than its own BF16 kernel on PCIe (the preprocess pass and 16-block dispatch dominate). Split-path phases at 8M: RS 10289 / AG 9446 µs; the
 barriers absorb 300–600 µs of rank skew on PCIe.
 
 ### 4.2 PCIe — RTX PRO 6000 Blackwell SE, 8 GPUs, sm_120, locked 2422 MHz (µs)
@@ -275,47 +286,70 @@ _(pending — being re-run with the final kernels; the previous-version numbers 
 
 | numel | TRT-BF16 | TRT-FP8 (grid) | myFP8 | NVFP4 split | **NVFP4 fused** (grid) | fused/BF16 | **fused/TRT-FP8** | split/TRT-FP8 |
 |---:|---:|---:|---:|---:|---:|:--:|:--:|:--:|
-| 32M | 652 | 176 (529) | 196 | 117 | **119** (128) | 5.5× | **1.49×** | 1.50× |
-| 128M | 2668 | 580 (2048) | 648 | 332 | **304** (512) | 8.8× | **1.91×** | 1.75× |
-| 512M | 10652 | 1863 (2048) | 2507 | 1160 | **1032** (2048) | 10.3× | **1.80×** | 1.61× |
-| 2G | 44417 | 7224 (2048) | 9854 | 4462 | **3780** (2048) | 11.8× | **1.91×** | 1.62× |
+| 32K | 29 | 46 (16) | 105 | 97 | **32** (16) | 0.91× | **1.43×** | 0.47× |
+| 128K | 31 | 46 (16) | 88 | 82 | **33** (16) | 0.95× | **1.42×** | 0.56× |
+| 512K | 34 | 45 (16) | 89 | 82 | **35** (16) | 0.98× | **1.29×** | 0.55× |
+| 2M | 54 | 48 (34) | 89 | 81 | **36** (32) | 1.50× | **1.33×** | 0.59× |
+| 8M | 167 | 60 (133) | 89 | 81 | **43** (128) | 3.9× | **1.42×** | 0.74× |
+| 32M | 647 | 176 (529) | 195 | 115 | **96** (256) | 6.8× | **1.84×** | 1.53× |
+| 128M | 2651 | 579 (2048) | 645 | 327 | **303** (512) | 8.8× | **1.91×** | 1.77× |
+| 512M | 10601 | 1861 (2048) | 2490 | 1156 | **1036** (2048) | 10.2× | **1.80×** | 1.61× |
+| 2G | 43760 | 7218 (2048) | 9801 | 4449 | **3779** (2048) | 11.6× | **1.91×** | 1.62× |
 
-One-shot, B200 (BF16 / myFP8 / **NVFP4**): 32M 1767 / 456 / **281**; 128M 7025 / 1682 / **1001**;
-512M 28072 / 6596 / **3852**; 2G 112445 / 26279 / **15323** — NVFP4/myFP8 = 1.62–1.71× at every size
-(byte ratio 1.89×; TRT-LLM has no FP8 one-shot).
+Below ~1M elements everything sits on the NVLink latency floor (~30 µs for a two-shot with two
+cross-GPU barriers): TRT-BF16 is the fastest there, NVFP4 fused ties it and beats TRT-FP8 by
+1.3–1.4× (TRT-FP8 pays its preprocess pass); the 5-launch split path pays ~50 µs of launch gaps and
+loses. From 2M up the fused kernel wins outright.
+
+One-shot, B200 (BF16 / myFP8 / **NVFP4**): 32K 22 / 63 / 63; 128K 18 / 54 / 53; 512K 32 / 54 / 54; 2M 92 / 63 / **54**;
+8M 439 / 145 / **93**; 32M 1746 / 457 / **280**; 128M 6948 / 1683 / **1002**; 512M 27831 / 6594 / **3848**;
+2G 111430 / 26269 / **15307** — NVFP4/myFP8 = 1.55–1.72× from 8M up (byte ratio 1.89×; TRT-LLM has no FP8
+one-shot); below 2M one-shot BF16 (a single kernel, one barrier) is fastest.
 
 Phases at 512M (`PHASE=1`, rank 0, µs): NVFP4 split quant 271 · bar 19 · RS 428 · bar 9 · AG 454 (Σ 1180);
 NVFP4 fused 1045; TRT-FP8 prep 286 + fused 1594 (Σ 1880); TRT-BF16 10641.
 
 ### 4.4 NVLink — GB300 NVL72, 8 GPUs = 2 nodes × 4, sm_103, 2070 MHz (µs), two-shot
 
-`bench_ar_mp` (fabric handles + IMEX). 2G row from the same-configuration run on the first rack
-(grid 2048 in both grid rules); the other rows from the second rack with the final grid rule.
+`bench_ar_mp` (fabric handles + IMEX), final kernels and default grid, one job on one NVL72 rack;
+earlier runs on two other racks agreed within 1–3 % at every size.
 
 | numel | TRT-BF16 | TRT-FP8 (grid) | myFP8 | NVFP4 split | **NVFP4 fused** (grid) | fused/BF16 | **fused/TRT-FP8** | split/TRT-FP8 |
 |---:|---:|---:|---:|---:|---:|:--:|:--:|:--:|
-| 32M | 664 | 172 (529) | 193 | 113 | **125** (128) | 5.3× | **1.37×** | 1.52× |
-| 128M | 2736 | 566 (2048) | 632 | 323 | **318** (512) | 8.6× | **1.78×** | 1.76× |
-| 512M | 10937 | 1809 (2048) | 2431 | 1141 | **1083** (2048) | 10.1× | **1.67×** | 1.59× |
-| 2G | 44755 | 7035 (2048) | 9485 | 4374 | **3956** (2048) | 11.3× | **1.78×** | 1.61× |
+| 32K | 29 | 42 (16) | 41 | 41 | **33** (16) | 0.87× | **1.29×** | 1.02× |
+| 128K | 31 | 43 (16) | 41 | 42 | **34** (16) | 0.91× | **1.26×** | 1.02× |
+| 512K | 34 | 42 (16) | 43 | 42 | **36** (16) | 0.94× | **1.16×** | 0.99× |
+| 2M | 56 | 45 (34) | 52 | 46 | **37** (32) | 1.49× | **1.21×** | 0.99× |
+| 8M | 172 | 58 (133) | 76 | 60 | **44** (128) | 3.9× | **1.31×** | 0.97× |
+| 32M | 665 | 172 (529) | 194 | 112 | **99** (256) | 6.7× | **1.73×** | 1.53× |
+| 128M | 2739 | 567 (2048) | 633 | 323 | **318** (512) | 8.6× | **1.78×** | 1.75× |
+| 512M | 10925 | 1811 (2048) | 2420 | 1143 | **1082** (2048) | 10.1× | **1.67×** | 1.59× |
+| 2G | 44211 | 7049 (2048) | 9512 | 4387 | **3968** (2048) | 11.1× | **1.78×** | 1.61× |
 
-One-shot, GB300 8 GPUs (BF16 / myFP8 / **NVFP4**): 32M 1700 / 465 / **273**; 128M 6774 / 1692 / **987**;
-512M 27090 / 6584 / **3836**; 2G 109675 / 26177 / **15231**.
+One-shot, GB300 8 GPUs (BF16 / myFP8 / **NVFP4**): 32K 12 / 23 / 23; 128K 14 / 25 / 23; 512K 31 / 35 / 30;
+2M 90 / 71 / **48**; 8M 440 / 164 / **93**; 32M 1735 / 466 / **274**; 128M 6924 / 1693 / **987**;
+512M 27667 / 6587 / **3839**; 2G 110739 / 26176 / **15231**.
 
-Cross-node NVLink numbers track single-node B200 within a few percent at every size; the 4-GPU
-single-node GB300 run of the first version (NVFP4/TRT-FP8 1.13 … 0.83×) is superseded.
+Cross-node (2 × 4) NVLink tracks single-node B200 within a few percent at every size — the latency
+floor (~30 µs), the 2M–8M region and the large-message asymptote all match. The 4-GPU single-node
+GB300 run of the first version (NVFP4/TRT-FP8 1.13 … 0.83×) is superseded.
 
 ### 4.5 Fused-kernel grid sweep (B200, 8 GPUs, µs)
 
-| numel | 64 | 128 | 256 | 512 | 1024 | 2048 blocks |
-|---:|---:|---:|---:|---:|---:|---:|
-| 32M | 184 | 119 | **95** | 107 | 132 | 193 |
-| 128M | | | **292** | 303 | 323 | 360 |
-| 512M | | | 1073 | 1065 | 1073 | **1032** |
+| numel | 16 | 32 | 64 | 128 | 256 | 512 | 1024 | 2048 blocks |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 32K | 32 (4 blk: 30) | | | | | | | |
+| 512K | **34** | | 34 | | 39 | | | |
+| 2M | 36 | **36** | 37 | 37 | 41 | 45 | | |
+| 8M | 166 | 94 | 59 | **43** | 48 | 61 | | |
+| 32M | | | 184 | 119 | **95** | 107 | 132 | 193 |
+| 128M | | | | | **292** | 303 | 323 | 360 |
+| 512M | | | | | 1073 | 1065 | 1073 | **1032** |
 
-Small messages want ~256 blocks (barrier traffic scales with blocks × ranks); ≥512M wants the full
-2048. The default rule (~4 chunks per thread, clamped to [16, 2048]) lands within 4 % of the best at
-128M/512M/2G and 25 % off at 32M; pass `grid` (header) / `NV_GRID` (bench) to pin it. On PCIe use 8–16.
+Up to 32M the best grid is "one chunk per block" (≈ shard / 8192) capped at 256 — more blocks add
+barrier traffic (blocks × ranks flag stores), fewer leave bandwidth idle; from 512M the full 2048 wins.
+That is the default rule; it is within 4 % of the best at every size above. On PCIe the optimum is
+4–8 blocks regardless of size (§4.1).
 
 ### 4.6 Codec ablation (first version; what the codec did and did not change)
 
@@ -336,8 +370,8 @@ decode (PRMT or hardware cvt) fixes that, and after it the access pattern (§2.4
 
 1. **vs TRT-LLM BF16 custom AR: NVFP4 fused wins 5.5–11.8× on NVLink and 3.7–4.6× on PCIe** (two-shot,
    8 GPUs); 6–7× one-shot on NVLink.
-2. **vs TRT-LLM's real FP8 kernel (fair grid): NVFP4 fused wins everywhere** — B200 1.49–1.91×,
-   GB300 2×4 1.37–1.78×, RTX 6000D 2.7–4.5× (up to 3.7× at 8M with an 8-block grid). The byte ratio
+2. **vs TRT-LLM's real FP8 kernel (fair grid): NVFP4 fused wins at every size on every card** — B200 1.29–1.91× (32K–2G),
+   GB300 2×4 1.16–1.78× (32K–2G), RTX 6000D 2.7–4.5× (up to 3.7× at 8M with an 8-block grid). The byte ratio
    is 1.89×; at ≥128M on NVLink the kernel realises 1.8–1.9× of it.
 3. **Follow TRT-LLM's access pattern, not just its algorithm.** The first version kept the two-shot
    algorithm but used an unrotated owner order and 4-byte loads and lost 17–31 % to TRT-FP8 on

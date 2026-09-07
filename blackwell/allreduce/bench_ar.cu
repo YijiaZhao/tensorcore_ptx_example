@@ -777,7 +777,11 @@ int main(int argc,char**argv){
     size_t sthr=shard/ELTS_PER_THREAD; int grid_s=int((sthr+TPB-1)/TPB);
     int grid_s32=int((shard/EPT32+TPB-1)/TPB), grid_ag32=int((numel/EPT32+TPB-1)/TPB);
     // fused NVFP4: one block per (TPB*32)-elt chunk of the shard, capped at NV_MAX_BLOCKS (env NV_GRID overrides)
-    int g_nv=(int)std::min<size_t>(std::max<size_t>((shard+(size_t)TPB*EPT32*4-1)/((size_t)TPB*EPT32*4),(size_t)16),(size_t)NV_MAX_BLOCKS); // ~4 chunks/thread, clamp [16,2048] (B200 sweep)
+    size_t nv_chunks=(shard+(size_t)TPB*EPT32-1)/((size_t)TPB*EPT32);
+    // NVLink rule from the B200 sweep: one chunk per block up to 256 blocks, then 4 chunks/thread up to 2048; floor 16.
+    // PCIe wants 4-8 blocks: set NV_GRID=8 (or NV_PCIE=1).
+    int g_nv=(int)std::min<size_t>(std::max<size_t>(std::max<size_t>(std::min<size_t>(nv_chunks,256),nv_chunks/4),(size_t)16),(size_t)NV_MAX_BLOCKS);
+    if(getenv("NV_PCIE")) g_nv=8;
     if(const char* e=getenv("NV_GRID")) g_nv=atoi(e);
     size_t epb_nv=((shard+(size_t)g_nv*TPB*EPT32-1)/((size_t)g_nv*TPB*EPT32))*((size_t)TPB*EPT32);
     // TRT grids: cap at MAX_BLOCKS, elts_per_block multiple of TPB*PACKED

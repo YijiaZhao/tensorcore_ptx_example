@@ -333,7 +333,7 @@ __global__ void twoshot_fused_kernel(
 //   barrier_in/out: device arrays[world] of every rank's uint32 barrier buffer,
 //                   fused_barrier_words(world) words each, zero-initialized once
 //   flag          : MONOTONIC uint32, +1 per call (parity selects the comm column set)
-//   grid          : blocks (<= MAX_BLOCKS); 0 = ~4 chunks/thread, clamped to [16, MAX_BLOCKS]
+//   grid          : blocks (<= MAX_BLOCKS); 0 = NVLink default rule (see below); PCIe: pass 4..8
 // -----------------------------------------------------------------------------
 template <int RANKS>
 inline void launch_fused_rank(
@@ -345,9 +345,11 @@ inline void launch_fused_rank(
     const size_t shard = numel / RANKS;
     const size_t slot  = fused_slot_bytes(shard);
     const float  SFr   = SFScaleVal / float(RANKS);
-    if (grid <= 0) {   // default: ~4 chunks per thread, clamped to [16, MAX_BLOCKS] (from the B200 grid sweep in README)
-        size_t g = (shard + size_t(TPB)*EPT32*4 - 1) / (size_t(TPB)*EPT32*4);
+    if (grid <= 0) {   // NVLink default (B200 sweep): one chunk/block up to 256 blocks, then 4 chunks/thread up to MAX_BLOCKS; floor 16.
+        size_t chunks = (shard + size_t(TPB)*EPT32 - 1) / (size_t(TPB)*EPT32);
+        size_t g = chunks < 256 ? chunks : 256; if (chunks/4 > g) g = chunks/4;
         if (g < 16) g = 16; if (g > size_t(MAX_BLOCKS)) g = MAX_BLOCKS; grid = int(g); }
+    // PCIe: pass grid = 4..8 explicitly (measured 1.3-1.8x faster than the NVLink default there).
     const size_t epb = ((shard + size_t(grid)*TPB*EPT32 - 1) / (size_t(grid)*TPB*EPT32)) * (size_t(TPB)*EPT32);
     twoshot_fused_kernel<RANKS><<<grid, TPB, 0, stream>>>(input, output, peer_comm, barrier_in, barrier_out,
                                                          rank, shard, slot, epb, SFScaleVal, SFr, flag);
