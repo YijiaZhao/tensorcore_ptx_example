@@ -19,13 +19,13 @@ blackwell/allreduce/
 
 ## 1. Test environment
 
-| machine | GPU | sm | GPUs used | interconnect | build toolchain | clock lock (verified) | how reached |
-|---|---|---|---|---|---|---|---|
-| `root@10.6.142.1` | RTX 6000D (cc 12.0) | sm_120 | 8 | PCIe | CUDA 13.3 nvcc, local | `nvidia-smi -lgc <max>` → ~2.35 GHz | direct root ssh |
-| computelab-aus-01 slurm, partition `rtx-pro-6000-blackwell-server-edition@cr+mp/genoa2d24g2l/8gpu-256cpu-2304gb` | RTX PRO 6000 Blackwell Server Edition | sm_120 | 8 | PCIe | no toolkit on node → static binary built on 142.1 (CUDA 13.3, `-cudart static`) | `srun --gpu-freq=high` → **2422 MHz** | `ssh computelab-aus-01`, `srun --gres=gpu:8` |
-| nsc-svg-slurm-1 (AI Hub / MARS, Norway), partition `batch` | B200 (cc 10.0) | sm_100 | 8 | NVLink | static binary built on 142.1 (CUDA 13.3) | `srun --gpu-freq=1965` → **1965 MHz** | `ssh -J computelab-sc-01 kimiz@nsc-svg-slurm-1-login-02.nvidia.com`, account `coreai_comparch_inferencex`, qos `normal` |
-| dlcluster, partition `gb300nvl72_preprod` | GB300 (cc 10.3, aarch64) | sm_103 | **4** (4 GPU/node) | NVLink | no toolkit on node → built inside pyxis container `nvcr.io#nvidia/tensorrt-llm/release:1.3.0rc13` (CUDA 13.1, aarch64) | `srun --gpu-freq=high` → **2070 MHz** | `ssh dlcluster`, account `blackwell`, `--gres=gpu:GB300:4` |
-| `root@10.6.142.14` (early data only) | RTX PRO 5000 Blackwell 72GB | sm_120 | 8 | PCIe, 2 NUMA (0–3 / 4–7, cross = SYS) | CUDA 13.0 nvcc, local | `-lgc` → ~2.6 GHz (power-capped, not pinned) | direct root ssh — **shared box, do not use for benchmarks** |
+| GPU | sm | GPUs | interconnect | build toolchain | clock lock (verified) |
+|---|---|---|---|---|---|
+| RTX 6000D (cc 12.0) | sm_120 | 8 | PCIe | CUDA 13.3 nvcc, local | `nvidia-smi -lgc <max>` → ~2.35 GHz |
+| RTX PRO 6000 Blackwell Server Edition | sm_120 | 8 | PCIe | static binary (`-cudart static`) built with CUDA 13.3 on an x86 host; no toolkit on the node | slurm `--gpu-freq=high` → **2422 MHz** |
+| B200 (cc 10.0) | sm_100 | 8 | NVLink | static binary built with CUDA 13.3 on an x86 host | slurm `--gpu-freq=1965` → **1965 MHz** |
+| GB300 (cc 10.3, aarch64) | sm_103 | **4** (4 GPU/node) | NVLink | built inside the container `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc13` (CUDA 13.1, aarch64); no toolkit on the node | slurm `--gpu-freq=high` → **2070 MHz** |
+| RTX PRO 5000 Blackwell 72GB (early data only) | sm_120 | 8 | PCIe, 2 NUMA (0–3 / 4–7, cross = SYS) | CUDA 13.0 nvcc, local | `-lgc` → ~2.6 GHz (power-capped, not pinned) |
 
 - Harness: single process, `cudaDeviceEnablePeerAccess` + raw peer pointers (no NCCL, no MPI).
 - Timing: CUDA events on rank 0; 20 warm-up + 100 timed iterations (5 + 20 for ≥128M elements). Numbers are µs per all-reduce.
@@ -122,12 +122,12 @@ Output per size: rel_rmse for every path, then
   TWO-SHOT  BF16=…  myFP8=…  TRT-FP8=…  NVFP4=…  | NVFP4/BF16=…x  NVFP4/myFP8=…x  NVFP4/TRT-FP8=…x  myFP8/TRT-FP8=…x
 ```
 
-### 3.3 Per-environment recipes (exactly what produced the tables)
+### 3.3 Recipes by machine type (exactly what produced the tables)
 
-**A. Direct root box (RTX 6000D, 10.6.142.1)**
+**A. Machine with a local CUDA toolkit and root (RTX 6000D, 8 GPUs)**
 ```bash
-scp bench_ar.cu root@10.6.142.1:~/nvfp4_allreduce/
-ssh root@10.6.142.1 '
+scp bench_ar.cu root@<host>:~/nvfp4_allreduce/
+ssh root@<host> '
   cd ~/nvfp4_allreduce && pkill -9 bench_ar
   /usr/local/cuda-13.3/bin/nvcc -gencode arch=compute_120a,code=sm_120a -O3 -std=c++17 bench_ar.cu -o bench_ar
   MAX=$(nvidia-smi --query-gpu=clocks.max.sm --format=csv,noheader,nounits | head -1)
@@ -136,12 +136,12 @@ ssh root@10.6.142.1 '
   nvidia-smi -rgc'
 ```
 
-**B. computelab slurm (RTX PRO 6000, 8 GPUs) — no toolkit on the node, no sudo**
+**B. Slurm node without a toolkit and without sudo (RTX PRO 6000, 8 GPUs)**
 ```bash
 # build a static binary on any CUDA 13.x box, ship it
 nvcc -gencode arch=compute_120a,code=sm_120a -O3 -std=c++17 -cudart static bench_ar.cu -o bench_ar_static
-scp bench_ar_static computelab-aus-01:~/nvfp4_allreduce/
-ssh computelab-aus-01 "srun -p 'rtx-pro-6000-blackwell-server-edition@cr+mp/genoa2d24g2l/8gpu-256cpu-2304gb' \
+scp bench_ar_static <slurm-login>:~/nvfp4_allreduce/
+ssh <slurm-login> "srun -p <partition> \
    --gres=gpu:8 --gpu-freq=high -t 0:40:0 bash -lc '
    cd ~/nvfp4_allreduce
    for N in 524288 8388608; do echo NUMEL=\$N; stdbuf -oL timeout 600 ./bench_ar_static \$N; done
@@ -149,21 +149,21 @@ ssh computelab-aus-01 "srun -p 'rtx-pro-6000-blackwell-server-edition@cr+mp/geno
 ```
 `--gpu-freq` is slurm's gres clock lock — it works without sudo (`sudo nvidia-smi -lgc` fails here).
 
-**C. B200 on nsc-svg-slurm-1 (AI Hub), 8 GPUs, NVLink**
+**C. Slurm B200 node (8 GPUs, NVLink)**
 ```bash
 nvcc -gencode arch=compute_100a,code=sm_100a -O3 -std=c++17 -cudart static bench_ar.cu -o bench_ar_b200
-scp -o "ProxyJump computelab-sc-01" bench_ar_b200 kimiz@nsc-svg-slurm-1-login-02.nvidia.com:~/nvfp4_allreduce/
-ssh -J computelab-sc-01 kimiz@nsc-svg-slurm-1-login-02.nvidia.com "srun -A coreai_comparch_inferencex --qos normal \
+scp bench_ar_b200 <slurm-login>:~/nvfp4_allreduce/
+ssh <slurm-login> "srun -A <account> --qos <qos> \
    -p batch --gres=gpu:8 --gpu-freq=1965 -t 1:30:0 bash -lc '
    cd ~/nvfp4_allreduce
    for N in 33554432 134217728 536870912 2147483648; do echo NUMEL=\$N; stdbuf -oL timeout 2400 ./bench_ar_b200 \$N; done
    nvidia-smi --query-gpu=clocks.sm --format=csv,noheader | head -1'"
 ```
 
-**D. GB300 on dlcluster, 4 GPUs/node, aarch64 — compile inside a CUDA container**
+**D. GB300 node (4 GPUs/node, aarch64) — compile inside a CUDA container**
 ```bash
-scp bench_ar.cu dlcluster:~/nvfp4_allreduce/
-ssh dlcluster "srun -A blackwell -p gb300nvl72_preprod --gres=gpu:GB300:4 --gpu-freq=high -t 1:30:0 \
+scp bench_ar.cu <slurm-login>:~/nvfp4_allreduce/
+ssh <slurm-login> "srun -A <account> -p <partition> --gres=gpu:GB300:4 --gpu-freq=high -t 1:30:0 \
    --container-image=nvcr.io#nvidia/tensorrt-llm/release:1.3.0rc13 --container-mounts=\$HOME/nvfp4_allreduce:/work \
    bash -lc '
    cd /work
