@@ -62,6 +62,9 @@ inline __device__ int4 add128b(T& a, T& b) {
 // TRT-LLM block_barrier VERBATIM (flag ping-pong + per-block offset). signals: [world][ ... ]
 __inline__ __device__ void block_barrier(uint32_t** signals, uint32_t const flag, size_t const local_rank,
     size_t const world_size, int const tidx, int const bidx) {
+#ifdef TRT_BARRIER_FIX
+    __syncthreads();   // NOT in TRT-LLM; build with -DTRT_BARRIER_FIX to test the effect on the verbatim kernels
+#endif
     if (tidx < world_size) {
         uint32_t flag_block_offset = (bidx + 1) * world_size;
         if (flag % 2 == 1)
@@ -292,18 +295,27 @@ __global__ void nvfp4_quantize(const __nv_bfloat16* __restrict__ in, uint8_t* __
     if(tid==0) *L.gscale(ob)=SF;
 }
 // NVFP4 one-shot: each rank reads every peer's payload, dequant->fp32 accumulate, bf16 out.
-__global__ void nvfp4_oneshot(uint8_t** peer, __nv_bfloat16* __restrict__ out, Nvfp4Layout L, int world){
-    const size_t tid=size_t(blockIdx.x)*blockDim.x+threadIdx.x; if(tid>=L.numel/ELTS_PER_THREAD) return;
-    const size_t base=tid*ELTS_PER_THREAD, po=base/2, si=base/SF_VEC_SIZE; float acc[8];
+__global__ void nvfp4_oneshot(uint8_t** peer, __nv_bfloat16* __restrict__ out, Nvfp4Layout L, int world, int rank){
+    // split one-shot (PULL): 32 elts/thread = 16 B packed + 2 B scales per peer, peer order rotated by rank
+    const size_t tid=size_t(blockIdx.x)*blockDim.x+threadIdx.x; if(tid>=L.numel/32) return;
+    const size_t g=tid*32, po=g/2, si=g/SF_VEC_SIZE; float acc[32];
 #pragma unroll
-    for(int i=0;i<8;i++) acc[i]=0;
-    for(int r=0;r<world;r++){ uint8_t* b=peer[r]; uint32_t e=*reinterpret_cast<const uint32_t*>(&L.packed(b)[po]);
-        float bs=ue4m3_to_float(L.scales(b)[si])*recip_ftz(*L.gscale(b));
+    for(int i=0;i<32;i++) acc[i]=0;
+    for(int ii=0;ii<world;ii++){ int r=(rank+ii)%world; uint8_t* b=peer[r];
+        uint4 e=*reinterpret_cast<const uint4*>(&L.packed(b)[po]);
+        uint16_t s2=*reinterpret_cast<const uint16_t*>(&L.scales(b)[si]);
+        float gs=recip_ftz(*L.gscale(b));
+        float bs0=ue4m3_to_float(uint8_t(s2&0xFF))*gs, bs1=ue4m3_to_float(uint8_t(s2>>8))*gs;
+        uint32_t w[4]={e.x,e.y,e.z,e.w};
 #pragma unroll
-        float dq[8]; decode8_e2m1(e,dq);
-        for(int i=0;i<8;i++) acc[i]+=dq[i]*bs; }
+        for(int q=0;q<4;q++){ float dq[8]; decode8_e2m1(w[q],dq); float bs=(q<2)?bs0:bs1;
 #pragma unroll
-    for(int i=0;i<8;i++) out[base+i]=__float2bfloat16(acc[i]);
+            for(int i=0;i<8;i++) acc[q*8+i]+=dq[i]*bs; } }
+#pragma unroll
+    for(int k=0;k<4;k++){ PackedBFloat16 pk;
+#pragma unroll
+        for(int j=0;j<4;j++) pk.unpacked[j]=__floats2bfloat162_rn(acc[k*8+2*j],acc[k*8+2*j+1]);
+        *reinterpret_cast<int4*>(&out[g+k*8])=pk.packed; }
 }
 static constexpr int EPT32 = 32;   // RS/AG: 32 elts/thread = one 16-byte packed load + one 2-byte scale load
 __global__ void nvfp4_reducescatter(uint8_t** peer, uint8_t* my, Nvfp4Layout L, int world, int rank, size_t shard, float SF){
@@ -366,6 +378,7 @@ __global__ void nvfp4_allgather(uint8_t** peer, __nv_bfloat16* __restrict__ out,
 static constexpr int NV_MAX_BLOCKS = 2048;
 __inline__ __device__ void block_barrier_mb(uint32_t** signals, uint32_t const flag, size_t const local_rank,
     size_t const world_size, int const tidx, int const bidx, int const max_blocks) {
+    __syncthreads();   // all data stores of the block issued before one thread publishes the flag (TRT omits this)
     if (tidx < world_size) {
         uint32_t flag_block_offset = (bidx + 1) * world_size;
         if (flag % 2 == 1) flag_block_offset += (max_blocks + 1) * world_size;
@@ -466,6 +479,61 @@ __global__ void nvfp4_twoshot_fused(
                 for(int j=0;j<4;j++) pk.unpacked[j]=__floats2bfloat162_rn(acc[k*8+2*j],acc[k*8+2*j+1]);
                 *reinterpret_cast<int4*>(dst+k*8)=pk.packed; }
         }
+    }
+}
+
+// ======================= NVFP4 fused one-shot — TRT-LLM oneShotAllReduceKernel structure =======================
+// quantize my chunk once, PUSH it (16 B + 2 B) into every peer's buffer at column local_rank (rotated order),
+// block_barrier, then reduce the RANKS columns of my own buffer locally -> BF16 output. Column = whole tensor.
+template <int RANKS>
+__global__ void nvfp4_oneshot_fused(
+    const __nv_bfloat16* __restrict__ local_input, __nv_bfloat16* __restrict__ local_output,
+    uint8_t** comm_bufs, uint32_t** barrier, int local_rank, size_t numel, size_t slot_bytes, size_t elts_per_block,
+    float SF, uint32_t flag)
+{
+    const int bidx=blockIdx.x, tidx=threadIdx.x;
+    const int buffer_offset=(flag%2==0)?0:RANKS;
+    const size_t packed_bytes=numel/2;
+    uint8_t* local_shared=comm_bufs[local_rank];
+    uint8_t* buffers[RANKS];
+#pragma unroll
+    for(int ii=0;ii<RANKS;ii++) buffers[ii]=comm_bufs[(local_rank+ii)%RANKS];
+    const size_t chunk_start=bidx*elts_per_block+tidx*EPT32;
+    const size_t chunk_end=min(chunk_start+elts_per_block, numel);
+    const float invSF=recip_ftz(SF);
+    for(size_t lo=chunk_start; lo<chunk_end; lo+=blockDim.x*EPT32){
+        float v[32];
+#pragma unroll
+        for(int k=0;k<4;k++){ PackedBFloat16 pk; pk.packed=*reinterpret_cast<const int4*>(local_input+lo+k*8);
+#pragma unroll
+            for(int j=0;j<4;j++){ float2 f=__bfloat1622float2(pk.unpacked[j]); v[k*8+2*j]=f.x; v[k*8+2*j+1]=f.y; } }
+        uint32_t ow[4]; uint8_t sfb[2];
+        nv_q16(v,SF,ow,sfb[0]); nv_q16(v+16,SF,ow+2,sfb[1]);
+        uint4 pk4=make_uint4(ow[0],ow[1],ow[2],ow[3]); uint16_t sc=uint16_t(sfb[0])|(uint16_t(sfb[1])<<8);
+#pragma unroll
+        for(int ii=0;ii<RANKS;ii++){
+            uint8_t* slot=buffers[ii]+(size_t)(buffer_offset+local_rank)*slot_bytes;
+            *reinterpret_cast<uint4*>(slot+lo/2)=pk4;
+            *reinterpret_cast<uint16_t*>(slot+packed_bytes+lo/SF_VEC_SIZE)=sc;
+        }
+    }
+    block_barrier_mb(barrier, flag, local_rank, RANKS, tidx, bidx, NV_MAX_BLOCKS);
+    for(size_t lo=chunk_start; lo<chunk_end; lo+=blockDim.x*EPT32){
+        float acc[32];
+#pragma unroll
+        for(int i=0;i<32;i++) acc[i]=0.f;
+#pragma unroll
+        for(int rank=0;rank<RANKS;rank++){ int ii=(rank+RANKS-local_rank)%RANKS;
+            const uint8_t* slot=local_shared+(size_t)(buffer_offset+ii)*slot_bytes;
+            uint4 e=*reinterpret_cast<const uint4*>(slot+lo/2);
+            uint16_t s2=*reinterpret_cast<const uint16_t*>(slot+packed_bytes+lo/SF_VEC_SIZE);
+            nv_dq32_acc(e,s2,invSF,acc); }
+        __nv_bfloat16* dst=local_output+lo;
+#pragma unroll
+        for(int k=0;k<4;k++){ PackedBFloat16 pk;
+#pragma unroll
+            for(int j=0;j<4;j++) pk.unpacked[j]=__floats2bfloat162_rn(acc[k*8+2*j],acc[k*8+2*j+1]);
+            *reinterpret_cast<int4*>(dst+k*8)=pk.packed; }
     }
 }
 
@@ -730,6 +798,8 @@ int main(int argc,char**argv){
     const size_t nv_slot_bytes=((shard/2+shard/SF_VEC_SIZE)+15)&~size_t(15);
     const size_t nv_barwords=2*(NV_MAX_BLOCKS+1)*world+8;
     std::vector<uint8_t*> d_nvc(world); std::vector<uint32_t*> d_nvba(world),d_nvbb(world);
+    const size_t nv1_slot_bytes=((numel/2+numel/SF_VEC_SIZE)+15)&~size_t(15);
+    std::vector<uint8_t*> d_nv1c(world); std::vector<uint32_t*> d_nv1b(world);
     const size_t barwords=2*(MAX_BLOCKS+1)*world + 8;
     for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r));
         CUDA_CHECK(cudaMalloc(&d_in[r],numel*2)); CUDA_CHECK(cudaMalloc(&d_out[r],numel*2));
@@ -745,6 +815,8 @@ int main(int argc,char**argv){
         CUDA_CHECK(cudaMalloc(&d_nvc[r],(size_t)2*world*nv_slot_bytes)); CUDA_CHECK(cudaMemset(d_nvc[r],0,(size_t)2*world*nv_slot_bytes));
         CUDA_CHECK(cudaMalloc(&d_nvba[r],nv_barwords*4)); CUDA_CHECK(cudaMemset(d_nvba[r],0,nv_barwords*4));
         CUDA_CHECK(cudaMalloc(&d_nvbb[r],nv_barwords*4)); CUDA_CHECK(cudaMemset(d_nvbb[r],0,nv_barwords*4));
+        CUDA_CHECK(cudaMalloc(&d_nv1c[r],(size_t)2*world*nv1_slot_bytes)); CUDA_CHECK(cudaMemset(d_nv1c[r],0,(size_t)2*world*nv1_slot_bytes));
+        CUDA_CHECK(cudaMalloc(&d_nv1b[r],nv_barwords*4)); CUDA_CHECK(cudaMemset(d_nv1b[r],0,nv_barwords*4));
         std::vector<__nv_bfloat16> tmp(numel); for(size_t i=0;i<numel;i++) tmp[i]=__float2bfloat16(hin[r][i]);
         CUDA_CHECK(cudaMemcpy(d_in[r],tmp.data(),numel*2,cudaMemcpyHostToDevice));
     }
@@ -754,7 +826,7 @@ int main(int argc,char**argv){
     std::vector<__nv_bfloat16**> pp_c1(world),pp_c2(world);
     std::vector<uint32_t**> pp_ba(world),pp_bb(world);
     std::vector<uint64_t**> pp_ctr(world);
-    std::vector<uint8_t**> pp_nvc(world); std::vector<uint32_t**> pp_nvba(world),pp_nvbb(world);
+    std::vector<uint8_t**> pp_nvc(world),pp_nv1c(world); std::vector<uint32_t**> pp_nvba(world),pp_nvbb(world),pp_nv1b(world);
     for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r));
         CUDA_CHECK(cudaMalloc(&pp_pl[r],world*8));  CUDA_CHECK(cudaMemcpy(pp_pl[r],d_pl.data(),world*8,cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMalloc(&pp_red[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_red[r],d_red.data(),world*8,cudaMemcpyHostToDevice));
@@ -770,6 +842,8 @@ int main(int argc,char**argv){
         CUDA_CHECK(cudaMalloc(&pp_nvc[r],world*8));  CUDA_CHECK(cudaMemcpy(pp_nvc[r],d_nvc.data(),world*8,cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMalloc(&pp_nvba[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_nvba[r],d_nvba.data(),world*8,cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMalloc(&pp_nvbb[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_nvbb[r],d_nvbb.data(),world*8,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&pp_nv1c[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_nv1c[r],d_nv1c.data(),world*8,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&pp_nv1b[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_nv1b[r],d_nv1b.data(),world*8,cudaMemcpyHostToDevice));
     }
 
     const int TPB=256; const int PACKED=8;
@@ -782,6 +856,11 @@ int main(int argc,char**argv){
     // PCIe wants 4-8 blocks: set NV_GRID=8 (or NV_PCIE=1).
     int g_nv=(int)std::min<size_t>(std::max<size_t>(std::max<size_t>(std::min<size_t>(nv_chunks,256),nv_chunks/4),(size_t)16),(size_t)NV_MAX_BLOCKS);
     if(getenv("NV_PCIE")) g_nv=8;
+    int grid_os32=int((numel/EPT32+TPB-1)/TPB);
+    size_t nv1_chunks=(numel+(size_t)TPB*EPT32-1)/((size_t)TPB*EPT32);
+    int g_nv1=(int)std::min<size_t>(std::max<size_t>(std::max<size_t>(std::min<size_t>(nv1_chunks,256),nv1_chunks/4),(size_t)16),(size_t)NV_MAX_BLOCKS);
+    if(const char* e=getenv("NV_GRID1")) g_nv1=atoi(e); else if(getenv("NV_PCIE")) g_nv1=8;
+    size_t epb_nv1=((numel+(size_t)g_nv1*TPB*EPT32-1)/((size_t)g_nv1*TPB*EPT32))*((size_t)TPB*EPT32);
     if(const char* e=getenv("NV_GRID")) g_nv=atoi(e);
     size_t epb_nv=((shard+(size_t)g_nv*TPB*EPT32-1)/((size_t)g_nv*TPB*EPT32))*((size_t)TPB*EPT32);
     // TRT grids: cap at MAX_BLOCKS, elts_per_block multiple of TPB*PACKED
@@ -820,7 +899,7 @@ int main(int argc,char**argv){
     auto run_nvfp4_oneshot=[&](){
         for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_quantize<<<grid,TPB>>>(d_in[r],d_pl[r],L,SF); }
         for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_oneshot<<<grid,TPB>>>(pp_pl[r],d_out[r],L,world); }
+        for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_oneshot<<<grid_os32,TPB>>>(pp_pl[r],d_out[r],L,world,r); }
         nvflag++;
     };
     auto run_nvfp4_twoshot=[&](){
@@ -830,6 +909,12 @@ int main(int argc,char**argv){
         for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag+1); }
         for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_allgather<<<grid_ag32,TPB>>>(pp_red[r],d_out[r],L,world,shard,r); }
         nvflag+=2;
+    };
+    uint32_t nv1flag=1;
+    auto run_nvfp4_oneshot_fused=[&](){
+        for(int r=0;r<world;r++){ cudaSetDevice(r);
+            nvfp4_oneshot_fused<NRANKS><<<g_nv1,TPB>>>(d_in[r],d_out[r],pp_nv1c[r],pp_nv1b[r],r,numel,nv1_slot_bytes,epb_nv1,SF,nv1flag); }
+        nv1flag++;
     };
     uint32_t nvfflag=1;
     auto run_nvfp4_fused=[&](){
@@ -874,6 +959,7 @@ int main(int argc,char**argv){
     run_nvfp4_oneshot(); sync_all(); check("NVFP4-oneshot");
     run_nvfp4_twoshot(); sync_all(); check("NVFP4-twoshot");
     run_nvfp4_fused();   sync_all(); check("NVFP4-fused");
+    run_nvfp4_oneshot_fused(); sync_all(); check("NVFP4-oneshot-fused");
 
     // ---------- timing ----------
     auto bench=[&](void(*)(),  const char*){}; (void)bench;
@@ -891,6 +977,7 @@ int main(int argc,char**argv){
     double t_trtf8=time_it(run_trt_fp8);
     double t_nv2 =time_it(run_nvfp4_twoshot);
     double t_nvf =time_it(run_nvfp4_fused);
+    double t_nv1f=time_it(run_nvfp4_oneshot_fused);
 
     double bf16B=numel*2.0;
     printf("PAYLOAD bytes/elt  BF16=2.000  FP8=%.4f (%.2fx)  NVFP4=%.4f (%.2fx)\n",
@@ -899,6 +986,7 @@ int main(int argc,char**argv){
     printf("TIMING (us/allreduce):\n");
     printf("  ONE-SHOT  BF16=%.2f  FP8=%.2f  NVFP4=%.2f  | NVFP4/BF16=%.2fx  NVFP4/FP8=%.2fx\n",
            t_trt1,t_f81,t_nv1, t_trt1/t_nv1, t_f81/t_nv1);
+    printf("  ONE-SHOT-FUSED NVFP4=%.2f (grid=%d)  | fused1/BF16=%.2fx  fused1 vs 3-launch=%.2fx\n", t_nv1f, g_nv1, t_trt1/t_nv1f, t_nv1/t_nv1f);
     printf("  (TRT-FP8 grid=%d blocks x %d thr)\n", lp_grid, LP_BLOCK);
     printf("  TWO-SHOT  BF16=%.2f  myFP8=%.2f  TRT-FP8=%.2f  NVFP4=%.2f  | NVFP4/BF16=%.2fx  NVFP4/myFP8=%.2fx  NVFP4/TRT-FP8=%.2fx  myFP8/TRT-FP8=%.2fx\n",
            t_trt2,t_f82,t_trtf8,t_nv2, t_trt2/t_nv2, t_f82/t_nv2, t_trtf8/t_nv2, t_f82/t_trtf8);

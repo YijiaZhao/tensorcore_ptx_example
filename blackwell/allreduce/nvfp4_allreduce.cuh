@@ -229,6 +229,11 @@ __global__ void barrier_kernel(uint64_t** sig, int rank, int world, uint64_t fla
 __device__ __forceinline__ void st_flag_release(uint32_t flag, uint32_t* addr){ asm volatile("st.global.release.sys.b32 [%1], %0;" ::"r"(flag), "l"(addr)); }
 __device__ __forceinline__ uint32_t ld_flag_acquire(uint32_t* addr){ uint32_t f; asm volatile("ld.global.acquire.sys.b32 %0, [%1];" : "=r"(f) : "l"(addr)); return f; }
 __device__ __forceinline__ void block_barrier(uint32_t** signals, uint32_t flag, int local_rank, int world, int tidx, int bidx){
+    // All threads of the block must have issued their data stores before one thread publishes the flag:
+    // bar.sync makes them "observed" by the flag-storing thread and st.release.sys (cumulative) orders them at
+    // system scope. TRT-LLM's block_barrier omits this __syncthreads(); with many blocks on PCIe that shows up
+    // as run-to-run non-determinism (see README).
+    __syncthreads();
     if (tidx < world) {
         uint32_t off = (bidx + 1) * world;
         if (flag % 2 == 1) off += (MAX_BLOCKS + 1) * world;
@@ -322,6 +327,62 @@ __global__ void twoshot_fused_kernel(
     }
 }
 
+// ======================= NVFP4 fused one-shot — TRT-LLM oneShotAllReduceKernel structure =======================
+// quantize my chunk once, PUSH it (16 B + 2 B) into every peer's buffer at column local_rank (rotated order),
+// block_barrier, then reduce the RANKS columns of my own buffer locally -> BF16 output. Column = whole tensor.
+template <int RANKS>
+__global__ void oneshot_fused_kernel(
+    const __nv_bfloat16* __restrict__ local_input, __nv_bfloat16* __restrict__ local_output,
+    uint8_t** comm_bufs, uint32_t** barrier, int local_rank, size_t numel, size_t slot_bytes, size_t elts_per_block,
+    float SF, uint32_t flag)
+{
+    const int bidx=blockIdx.x, tidx=threadIdx.x;
+    const int buffer_offset=(flag%2==0)?0:RANKS;
+    const size_t packed_bytes=numel/2;
+    uint8_t* local_shared=comm_bufs[local_rank];
+    uint8_t* buffers[RANKS];
+#pragma unroll
+    for(int ii=0;ii<RANKS;ii++) buffers[ii]=comm_bufs[(local_rank+ii)%RANKS];
+    const size_t chunk_start=bidx*elts_per_block+tidx*EPT32;
+    const size_t chunk_end=min(chunk_start+elts_per_block, numel);
+    const float invSF=recip_ftz(SF);
+    for(size_t lo=chunk_start; lo<chunk_end; lo+=blockDim.x*EPT32){
+        float v[32];
+#pragma unroll
+        for(int k=0;k<4;k++){ Packed16 pk; pk.packed=*reinterpret_cast<const int4*>(local_input+lo+k*8);
+#pragma unroll
+            for(int j=0;j<4;j++){ float2 f=__bfloat1622float2(pk.unpacked[j]); v[k*8+2*j]=f.x; v[k*8+2*j+1]=f.y; } }
+        uint32_t ow[4]; uint8_t sfb[2];
+        q16(v,SF,ow,sfb[0]); q16(v+16,SF,ow+2,sfb[1]);
+        uint4 pk4=make_uint4(ow[0],ow[1],ow[2],ow[3]); uint16_t sc=uint16_t(sfb[0])|(uint16_t(sfb[1])<<8);
+#pragma unroll
+        for(int ii=0;ii<RANKS;ii++){
+            uint8_t* slot=buffers[ii]+(size_t)(buffer_offset+local_rank)*slot_bytes;
+            *reinterpret_cast<uint4*>(slot+lo/2)=pk4;
+            *reinterpret_cast<uint16_t*>(slot+packed_bytes+lo/SF_VEC_SIZE)=sc;
+        }
+    }
+    block_barrier(barrier, flag, local_rank, RANKS, tidx, bidx);
+    for(size_t lo=chunk_start; lo<chunk_end; lo+=blockDim.x*EPT32){
+        float acc[32];
+#pragma unroll
+        for(int i=0;i<32;i++) acc[i]=0.f;
+#pragma unroll
+        for(int rank=0;rank<RANKS;rank++){ int ii=(rank+RANKS-local_rank)%RANKS;
+            const uint8_t* slot=local_shared+(size_t)(buffer_offset+ii)*slot_bytes;
+            uint4 e=*reinterpret_cast<const uint4*>(slot+lo/2);
+            uint16_t s2=*reinterpret_cast<const uint16_t*>(slot+packed_bytes+lo/SF_VEC_SIZE);
+            dq32_acc(e,s2,invSF,acc); }
+        __nv_bfloat16* dst=local_output+lo;
+#pragma unroll
+        for(int k=0;k<4;k++){ Packed16 pk;
+#pragma unroll
+            for(int j=0;j<4;j++) pk.unpacked[j]=__floats2bfloat162_rn(acc[k*8+2*j],acc[k*8+2*j+1]);
+            *reinterpret_cast<int4*>(dst+k*8)=pk.packed; }
+    }
+}
+
+
 // -----------------------------------------------------------------------------
 // Host launchers. Precondition: caller already cudaSetDevice(rank); launch ALL `world` ranks
 // before synchronizing any of them (the in-kernel barriers need every rank in flight).
@@ -353,6 +414,29 @@ inline void launch_fused_rank(
     const size_t epb = ((shard + size_t(grid)*TPB*EPT32 - 1) / (size_t(grid)*TPB*EPT32)) * (size_t(TPB)*EPT32);
     twoshot_fused_kernel<RANKS><<<grid, TPB, 0, stream>>>(input, output, peer_comm, barrier_in, barrier_out,
                                                          rank, shard, slot, epb, SFScaleVal, SFr, flag);
+}
+
+// launch_oneshot_fused_rank (one kernel, TRT-LLM oneShotAllReduceKernel structure):
+//   comm : oneshot_comm_bytes(numel, RANKS) bytes per rank, peer-visible (column = whole tensor)
+//   barrier : fused_barrier_words(RANKS) uint32 per rank; flag +1 per call
+//   Wins over two-shot below ~2M elements on NVLink is NOT the case (both sit on the latency floor);
+//   on PCIe use grid = 1 and prefer the two-shot fused kernel unless the message is tiny.
+__host__ __device__ inline size_t oneshot_slot_bytes(size_t numel){ return ((numel/2 + numel/SF_VEC_SIZE) + 15) & ~size_t(15); }
+__host__ __device__ inline size_t oneshot_comm_bytes(size_t numel, int world){ return size_t(2)*world*oneshot_slot_bytes(numel); }
+template <int RANKS>
+inline void launch_oneshot_fused_rank(
+    const __nv_bfloat16* input, __nv_bfloat16* output,
+    uint8_t** peer_comm, uint32_t** barrier,
+    int rank, size_t numel, float SFScaleVal, uint32_t flag,
+    cudaStream_t stream = 0, int TPB = 256, int grid = 0)
+{
+    const size_t slot = oneshot_slot_bytes(numel);
+    if (grid <= 0) {
+        size_t chunks = (numel + size_t(TPB)*EPT32 - 1) / (size_t(TPB)*EPT32);
+        size_t g = chunks < 256 ? chunks : 256; if (chunks/4 > g) g = chunks/4;
+        if (g < 16) g = 16; if (g > size_t(MAX_BLOCKS)) g = MAX_BLOCKS; grid = int(g); }
+    const size_t epb = ((numel + size_t(grid)*TPB*EPT32 - 1) / (size_t(grid)*TPB*EPT32)) * (size_t(TPB)*EPT32);
+    oneshot_fused_kernel<RANKS><<<grid, TPB, 0, stream>>>(input, output, peer_comm, barrier, rank, numel, slot, epb, SFScaleVal, flag);
 }
 
 // launch_twoshot_rank (split path, five launches; `flag` consumes flag and flag+1):
