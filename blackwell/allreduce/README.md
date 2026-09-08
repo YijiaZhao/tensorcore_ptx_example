@@ -423,19 +423,25 @@ two other racks agreed within 1–3 % at every size.
 | 512M | 10883 | 1810 (2048) | **1086** (2048) | 10.0× | **1.67×** |
 | 2G | 44365 | 7025 (2048) | **3974** (2048) | 11.2× | **1.77×** |
 
-One-shot (NVFP4 split = 3 launches; NVFP4 fused = one PUSH kernel, default grid):
+One-shot (NVFP4 split = 3 launches; NVFP4 fused = one PUSH kernel; default grid and best grid from the sweep
+over {16, 64, 256, 1024, 2048} blocks; ratio uses the best):
 
-| numel | TRT-BF16 | NVFP4 split | **NVFP4 fused** (blocks) | **NVFP4 fused/BF16** |
-|---:|---:|---:|---:|:--:|
-| 32K | 12 | 30 | **12.6** (16) | 0.95× |
-| 128K | 14 | 31 | **12.5** (16) | 1.13× |
-| 512K | 30 | 31 | **15.1** (64) | 2.0× |
-| 2M | 89 | 38 | **30.4** (256) | 2.9× |
-| 8M | 432 | 79 | **80** (256) | 5.4× |
-| 32M | 1721 | 248 | **243** (1024) | 7.1× |
-| 128M | 6859 | 902 | **890** (2048) | 7.7× |
-| 512M | 27455 | 3505 | **3509** (2048) | 7.8× |
-| 2G | 109829 | 13891 | **13975** (2048) | 7.9× |
+| numel | TRT-BF16 | NVFP4 split | NVFP4 fused default (blocks) | **NVFP4 fused best** (blocks) | **NVFP4/BF16** |
+|---:|---:|---:|---:|---:|:--:|
+| 32K | 12 | 30 | 12.6 (16) | **12.8** (16) | **0.94×** |
+| 128K | 14 | 31 | 12.5 (16) | **12.4** (16) | **1.14×** |
+| 512K | 30 | 31 | 15.1 (64) | **14.7** (64) | **2.1×** |
+| 2M | 89 | 38 | 30.4 (256) | **30.2** (256) | **2.9×** |
+| 8M | 432 | 79 | 80 (256) | **79** (1024) | **5.5×** |
+| 32M | 1721 | 248 | 243 (1024) | **239** (2048) | **7.2×** |
+| 128M | 6859 | 902 | 890 (2048) | **890** (2048) | **7.7×** |
+| 512M | 27455 | 3505 | 3509 (2048) | **3509** (2048) | **7.8×** |
+| 2G | 109829 | 13891 | 13975 (2048) | **13975** (2048) | **7.9×** |
+
+Fused one-shot grid sweep (µs): 512K — 16 blk 21.6 · 64 **14.7** · 256 19.7 · 1024 29.0 · 2048 46.1; 8M — 16 blk 200 ·
+64 98 · 256 80 · 1024 **79** · 2048 93; 32M — 64 blk 395 · 256 279 · 1024 243 · 2048 **239**; 128M — 256 blk 1062 ·
+1024 914 · 2048 **890**; 512M — 256 blk 4192 · 1024 3605 · 2048 **3509** (2G not swept; 2048 is the default and the
+trend from 32M up). Same shape as B200: the default rule is within 3 % of the best everywhere.
 
 The fused one-shot ties TRT-LLM's BF16 one-shot on the ~12 µs latency floor and wins from 128K up; it is
 the fastest NVFP4 variant below ~1M (one barrier instead of two), the fused two-shot above ~8M.
