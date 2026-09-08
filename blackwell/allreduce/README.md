@@ -308,18 +308,19 @@ own optimum here; TRT-BF16 (64 blocks, not tunable without editing the kernel) v
 same way, so its column overstates the NVFP4 advantage on PCIe. Below ~1M TRT-FP8 is slower than
 TRT-BF16 even at its best grid (preprocess pass), which is why TRT-LLM only enables it from 2M up.
 
-One-shot (no TRT-LLM FP8 one-shot exists). NVFP4 split = quantize | barrier | pull-reduce (3 launches);
-NVFP4 fused = one PUSH kernel, best grid in parentheses:
+One-shot (no TRT-LLM FP8 one-shot exists). Two NVFP4 variants: *split* = quantize | barrier | pull-reduce
+(3 launches, full grid); *fused* = one PUSH kernel, default grid and best grid from the sweep over
+{1, 2, 4, default} blocks. The ratio uses the faster of the two variants (bold).
 
-| numel | TRT-BF16 | NVFP4 split | NVFP4 fused (blocks) | **best NVFP4** | **NVFP4/BF16** |
+| numel | TRT-BF16 | NVFP4 split | NVFP4 fused default (blocks) | NVFP4 fused best (blocks) | **NVFP4/BF16** (variant) |
 |---:|---:|---:|---:|---:|:--:|
-| 32K | 569 | **110** | 152 (1) | 110 | **5.2×** |
-| 128K | 2350 | **416** | 603 (1) | 416 | **5.6×** |
-| 512K | 9866 | 4654 | **2238** (1) | 2238 | **4.4×** |
-| 8M | 158265 | 85763 | **34342** (1) | 34342 | **4.6×** |
+| 32K | 569 | **110** | 206 (16) | 152 (1) | **5.2×** (split) |
+| 128K | 2350 | **416** | 777 (16) | 603 (1) | **5.6×** (split) |
+| 512K | 9866 | 4654 | 3103 (64) | **2238** (1) | **4.4×** (fused) |
+| 8M | 158265 | 85763 | 48583 (256) | **34342** (1) | **4.6×** (fused) |
 
 On PCIe the fused one-shot pushes 8 small packets per thread; below ~256K the pull-based split version
-is faster, above it the fused kernel wins 2–2.5×. Two-shot split path: 82 / 233 / 899 / 20503 µs.
+is faster, above it the fused kernel (1 block) wins 2–2.5×. Two-shot split path: 82 / 233 / 899 / 20503 µs.
 
 ### 4.2 PCIe — RTX PRO 6000 Blackwell SE, 8 GPUs, sm_120, locked 2295–2347 MHz (µs)
 
@@ -350,14 +351,14 @@ Same picture as the 6000D: TRT-FP8 at 1 block is 2.1× faster than at its fixed 
 1–2 blocks, and TRT-FP8 stays slower than TRT-BF16 below ~256K. This box is 1.4× faster than the 6000D at
 8M for every kernel. TRT-LLM's BF16 one-shot showed the §2.5 race here too (rel_rmse 0.015 on one 512K run).
 
-One-shot (NVFP4 split = 3 launches; NVFP4 fused = one PUSH kernel, best grid in parentheses):
+One-shot, same layout as §4.1 (fused swept over {1, 2, 4} blocks on this node; the default grid was not run here):
 
-| numel | TRT-BF16 | NVFP4 split | NVFP4 fused (blocks) | **best NVFP4** | **NVFP4/BF16** |
-|---:|---:|---:|---:|---:|:--:|
-| 32K | 359 | **66** | 106 (1) | 66 | **5.4×** |
-| 128K | 1541 | **239** | 410 (1) | 239 | **6.4×** |
-| 512K | 6771 | 2415 | **1606** (1) | 1606 | **4.2×** |
-| 8M | 117766 | 46015 | **24848** (1) | 24848 | **4.7×** |
+| numel | TRT-BF16 | NVFP4 split | NVFP4 fused best (blocks) | **NVFP4/BF16** (variant) |
+|---:|---:|---:|---:|:--:|
+| 32K | 359 | **66** | 106 (1) | **5.4×** (split) |
+| 128K | 1541 | **239** | 410 (1) | **6.4×** (split) |
+| 512K | 6771 | 2415 | **1606** (1) | **4.2×** (fused) |
+| 8M | 117766 | 46015 | **24848** (1) | **4.7×** (fused) |
 
 Two-shot split path: 91 / 148 / 571 / 11145 µs.
 
