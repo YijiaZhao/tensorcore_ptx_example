@@ -256,15 +256,15 @@ given as a one-line note per table.
 
 ### 4.1 PCIe — RTX 6000D, 8 GPUs, sm_120, locked 2355 MHz (µs)
 
-Two-shot. TRT-FP8 at its native PCIe dispatch (16 blocks × 512 threads). NVFP4 fused shown with the
-default grid and with `NV_GRID=4` (the PCIe optimum); ratios use the `NV_GRID=4` column.
+Two-shot; block counts in parentheses. TRT-FP8 at its native PCIe dispatch (16 blocks × 512 threads).
+NVFP4 fused with the default grid and with `NV_GRID=4` (the PCIe optimum); ratios use the `NV_GRID=4` column.
 
-| numel | TRT-BF16 | TRT-FP8 (blocks) | NVFP4 fused, default (blocks) | **NVFP4 fused, 4 blocks** | NVFP4/BF16 | **NVFP4/TRT-FP8** |
+| numel | TRT-BF16 | TRT-FP8 (blocks) | NVFP4 fused (blocks) | **NVFP4 fused, `NV_GRID=4`** (blocks) | NVFP4/BF16 | **NVFP4/TRT-FP8** |
 |---:|---:|---:|---:|---:|:--:|:--:|
-| 32K | 92 | 227 (16) | 68 (16) | **38** | 2.4× | **6.0×** |
-| 128K | 440 | 657 (16) | 146 (16) | **99** | 4.4× | **6.6×** |
-| 512K | 2167 | 2102 (16) | 475 (16) | **400** | 5.4× | **5.3×** |
-| 8M | 49559 | 36078 (16) | 14479 (128) | **8588** | 5.8× | **4.2×** |
+| 32K | 92 | 227 (16) | 68 (16) | **38** (4) | 2.4× | **6.0×** |
+| 128K | 440 | 657 (16) | 146 (16) | **99** (4) | 4.4× | **6.6×** |
+| 512K | 2167 | 2102 (16) | 475 (16) | **400** (4) | 5.4× | **5.3×** |
+| 8M | 49559 | 36078 (16) | 14479 (128) | **8588** (4) | 5.8× | **4.2×** |
 
 One-shot (no TRT-LLM FP8 one-shot exists):
 
@@ -285,12 +285,12 @@ changes nothing on PCIe (8M: 36078 at 16 blocks, 37093 at 133). Fused NVFP4 grid
 
 Same layout as §4.1.
 
-| numel | TRT-BF16 | TRT-FP8 (blocks) | NVFP4 fused, default (blocks) | **NVFP4 fused, 4 blocks** | NVFP4/BF16 | **NVFP4/TRT-FP8** |
+| numel | TRT-BF16 | TRT-FP8 (blocks) | NVFP4 fused (blocks) | **NVFP4 fused, `NV_GRID=4`** (blocks) | NVFP4/BF16 | **NVFP4/TRT-FP8** |
 |---:|---:|---:|---:|---:|:--:|:--:|
-| 32K | 73 | 134 (16) | 51 (16) | **32** | 2.3× | **4.2×** |
-| 128K | 348 | 396 (16) | 112 (16) | **90** | 3.9× | **4.4×** |
-| 512K | 1474 | 1183 (16) | 447 (16) | **333** | 4.4× | **3.6×** |
-| 8M | 29982 | 21314 (133)¹ | 9638 (128) | **5354** | 5.6× | **4.0×** |
+| 32K | 73 | 134 (16) | 51 (16) | **32** (4) | 2.3× | **4.2×** |
+| 128K | 348 | 396 (16) | 112 (16) | **90** (4) | 3.9× | **4.4×** |
+| 512K | 1474 | 1183 (16) | 447 (16) | **333** (4) | 4.4× | **3.6×** |
+| 8M | 29982 | 21314 (133)¹ | 9638 (128) | **5354** (4) | 5.6× | **4.0×** |
 
 ¹ measured with the scaled grid; on PCIe the 16-block native dispatch is within 4 % (§4.1).
 
