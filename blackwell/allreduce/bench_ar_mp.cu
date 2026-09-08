@@ -808,7 +808,8 @@ int main(int argc,char**argv){
     if(WORLD!=NRANKS){ printf("[p%d] WORLD=%d (NPROC %d x LOCAL %d) != NRANKS=%d\n",PROC,WORLD,NPROC,LOCAL,NRANKS); return 1; }
     if(numel%(size_t(WORLD)*EPT32)!=0){ printf("numel must be %d-aligned\n",WORLD*EPT32); return 1; }
     const int world=WORLD; const size_t shard=numel/world;
-    std::string jid=(e=getenv("SLURM_JOB_ID"))?e:"local"; std::string dir="/work/hs_"+jid+"_"+std::to_string(numel); mkdir(dir.c_str(),0777);
+    std::string jid=(e=getenv("SLURM_JOB_ID"))?e:"local"; std::string tag=(e=getenv("HS_TAG"))?e:"";   // HS_TAG: unique per invocation when the same numel runs twice in one job
+    std::string dir="/work/hs_"+jid+"_"+std::to_string(numel)+(tag.empty()?"":"_"+tag); mkdir(dir.c_str(),0777);
     CU_CHECK(cuInit(0));
     for(int d=0;d<LOCAL;d++){ CUDA_CHECK(cudaSetDevice(d)); CUDA_CHECK(cudaFree(0));
         for(int j=0;j<LOCAL;j++) if(j!=d){ int can=0; cudaDeviceCanAccessPeer(&can,d,j); if(can){ cudaError_t r=cudaDeviceEnablePeerAccess(j,0); if(r!=cudaSuccess&&r!=cudaErrorPeerAccessAlreadyEnabled) CUDA_CHECK(r);} } }

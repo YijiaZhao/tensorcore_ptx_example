@@ -363,23 +363,24 @@ NVFP4 fused with the default grid rule (§2.2).
 | 512M | 10665 | 1861 (2048) | **1037** (2048) | 10.3× | **1.80×** |
 | 2G | 44304 | 7216 (2048) | **3776** (2048) | 11.7× | **1.91×** |
 
-One-shot (NVFP4 split = 3 launches; NVFP4 fused = one PUSH kernel, default grid):
+One-shot (NVFP4 split = 3 launches; NVFP4 fused = one PUSH kernel; default grid and best grid from the sweep
+over {16, 64, 256, 1024, 2048} blocks; ratio uses the best):
 
-| numel | TRT-BF16 | NVFP4 split | **NVFP4 fused** (blocks) | **NVFP4 fused/BF16** |
-|---:|---:|---:|---:|:--:|
-| 32K | 18 | 54 | **16.1** (16) | 1.12× |
-| 128K | 18 | 54 | **16.4** (16) | 1.10× |
-| 512K | 32 | 53 | **16.2** (64) | 2.0× |
-| 2M | 91 | 55 | **31** (256) | 2.9× |
-| 8M | 445 | 79 | **81** (256) | 5.5× |
-| 32M | 1771 | 252 | **244** (1024) | 7.3× |
-| 128M | 7033 | 911 | **895** (2048) | 7.9× |
-| 512M | 28134 | 3515 | **3533** (2048) | 8.0× |
-| 2G | 112747 | 14182 | **14078** (2048) | 8.0× |
+| numel | TRT-BF16 | NVFP4 split | NVFP4 fused default (blocks) | **NVFP4 fused best** (blocks) | **NVFP4/BF16** |
+|---:|---:|---:|---:|---:|:--:|
+| 32K | 18 | 54 | 16.1 (16) | **16.1** (16) | **1.12×** |
+| 128K | 18 | 54 | 16.4 (16) | **16.1** (16) | **1.12×** |
+| 512K | 32 | 53 | 16.2 (64) | **16.2** (64) | **2.0×** |
+| 2M | 91 | 55 | 31 (256) | **31** (256) | **2.9×** |
+| 8M | 445 | 79 | 81 (256) | **79** (1024) | **5.6×** |
+| 32M | 1771 | 252 | 244 (1024) | **240** (2048) | **7.4×** |
+| 128M | 7033 | 911 | 895 (2048) | **895** (2048) | **7.9×** |
+| 512M | 28134 | 3515 | 3533 (2048) | **3528** (2048) | **8.0×** |
+| 2G | 112747 | 14182 | 14078 (2048) | **14078** (2048) | **8.0×** |
 
-Fused one-shot grid sweep (µs): 512K — 16 blk 22.7 · 64 **16.4** · 256 20.2 · 1024 28.9; 8M — 16 blk 203 · 64 101 ·
-256 81.6 · 1024 **78.9**; 32M — 64 blk 417 · 256 284 · 1024 **244**. The one-shot pushes RANKS copies, so it
-wants more blocks than the two-shot at the same size; the default rule is within 5 % of the best.
+Fused one-shot grid sweep (µs): 512K — 16 blk 23.3 · 64 **16.2** · 256 20.5 · 1024 29.2 · 2048 46.2; 8M — 16 blk 203 ·
+64 101 · 256 81 · 1024 **79** · 2048 93; 32M — 64 blk 408 · 256 283 · 1024 245 · 2048 **240**. The one-shot pushes
+RANKS copies, so it tolerates more blocks than the two-shot; the default rule is within 3 % of the best everywhere.
 
 Below ~1M elements everything sits on the NVLink latency floor: a one-shot (one barrier) at ~16 µs, a
 two-shot (two barriers) at ~30 µs. There the fused NVFP4 one-shot is the fastest kernel of all (1.1× over
