@@ -30,7 +30,7 @@ Headline (two-shot, 8 GPUs, clocks locked, µs; **fused NVFP4 vs TRT-LLM FP8**):
 vs TRT-LLM BF16 custom AR the fused NVFP4 kernel is 3.9–11.8× faster on NVLink (≥8M) and 2.3–6.3× on PCIe (best grid).
 **PCIe caveat:** TRT-FP8 with 1 block instead of its fixed 16 is up to 2.6× faster on the 6000D; the PCIe ratios above give TRT-FP8 that best grid (§4.1).
 One-shot: the fused NVFP4 one-shot beats TRT-LLM's BF16 one-shot at every size on NVLink (1.1× on the 16 µs latency floor, 5–8× from 8M up) and 4.4–5.6× on PCIe.
-**PCIe wire transport (§2.5, §4.1, §4.6):** on the 8× RTX 6000D every in-kernel all-reduce — ours and TRT-LLM's — moves ~1 GB/s per rank because SM stores across the CPU root complex degrade to small PCIe transactions. Moving the same NVFP4 bytes with GPUDirect RDMA through the host's own NICs (one 400G port per GPU, RC QPs between ranks) reaches 32–40 GB/s per rank: two-shot **387 µs at 8M vs 7969 µs in-kernel, 14056 µs TRT-FP8 (best grid) and 49833 µs TRT-BF16**; one-shot 833 µs vs 158265 µs TRT-BF16 one-shot.
+**PCIe wire transport (§2.5, §4.1, §4.6):** on the 8× RTX 6000D every in-kernel all-reduce — ours and TRT-LLM's — moves ~1 GB/s per rank because SM stores across the CPU root complex degrade to small PCIe transactions. Moving the same NVFP4 bytes with GPUDirect RDMA through the host's own NICs (one 400G port per GPU, RC QPs between ranks) reaches 34–43 GB/s per rank: two-shot **341 µs at 8M vs 7969 µs in-kernel, 14056 µs TRT-FP8 (best grid) and 49833 µs TRT-BF16**; one-shot 809 µs vs 158265 µs TRT-BF16 one-shot.
 Accuracy cost: rel_rmse 0.14 (two-shot, two quantization passes) / 0.10 (one-shot) vs 0.037 (FP8) vs 0.004 (BF16).
 
 ---
@@ -314,23 +314,24 @@ sweep table), then NVFP4 with the three wire transports of §2.5 — `sm` = in-k
 
 | numel | TRT-BF16 | TRT-FP8 (blocks) | NVFP4 `sm` (blocks) | NVFP4 `ce` | NVFP4 `rdma` | NVFP4 vs TRT-FP8 | NVFP4 vs TRT-BF16 |
 |---:|---:|---:|---:|---:|---:|:--:|:--:|
-| 32K | 99 | 215 (4) | **35** (1) | 551 | 228 | **6.1×** | 2.8× |
-| 128K | 427 | 441 (1) | **95** (4) | 566 | 216 | **4.6×** | 4.5× |
-| 512K | 2164 | 1077 (1) | 371 (2) | 546 | **221** | **4.9×** | 9.8× |
-| 8M | 49833 | 14056 (1) | 7969 (1) | 1050 | **387** | **36×** | 129× |
-| 32M | — | — | 32969 (1) | 3172 | **1017** | — | — |
+| 32K | 99 | 215 (4) | **35** (1) | 447 | 160 | **6.1×** | 2.8× |
+| 128K | 427 | 441 (1) | **95** (4) | 451 | 166 | **4.6×** | 4.5× |
+| 512K | 2164 | 1077 (1) | 371 (2) | 448 | **172** | **6.3×** | 12.6× |
+| 8M | 49833 | 14056 (1) | 7969 (1) | 898 | **341** | **41×** | 146× |
+| 32M | — | — | 32969 (1) | 2982 | **960** | — | — |
 
 **One-shot** (TRT-LLM has no FP8 one-shot; NVFP4 `sm` = the faster of the split and fused in-kernel variants)
 
 | numel | TRT-BF16 | NVFP4 `sm` (variant) | NVFP4 `ce` | NVFP4 `rdma` | NVFP4 vs TRT-BF16 |
 |---:|---:|---:|---:|---:|:--:|
-| 32K | 569 | 110 (split) | 234 | **114** | **5.0×** |
-| 128K | 2350 | 416 (split) | 227 | **127** | **18.5×** |
-| 512K | 9866 | 2238 (fused, 1 blk) | 290 | **155** | **64×** |
-| 8M | 158265 | 34342 (fused, 1 blk) | 3163 | **833** | **190×** |
+| 32K | 569 | 110 (split) | 248 | **98** | **5.8×** |
+| 128K | 2350 | 416 (split) | 227 | **107** | **22×** |
+| 512K | 9866 | 2238 (fused, 1 blk) | 290 | **139** | **71×** |
+| 8M | 158265 | 34342 (fused, 1 blk) | 3358 | **809** | **196×** |
 
+`ce`/`rdma` columns use the tuned defaults from the transport sweep below (one contiguous slot per peer).
 Fastest NVFP4 all-reduce per size on this box: 32K two-shot `sm` 35 µs · 128K two-shot `sm` 95 µs · 512K
-one-shot `rdma` 155 µs · 8M two-shot `rdma` 387 µs · 32M two-shot `rdma` 1017 µs.
+one-shot `rdma` 139 µs · 8M two-shot `rdma` 341 µs · 32M two-shot `rdma` 960 µs.
 
 **Grid sweep of the in-kernel variants** (µs; TRT-FP8 via `TRT_FP8_GRID`, NVFP4 fused via `NV_GRID`; TRT-FP8's
 native dispatch is 16 blocks, the NVFP4 default rule gives 16 blocks below 8M and 128 at 8M):
@@ -355,11 +356,11 @@ Notes.
   grid (preprocess pass), which is why TRT-LLM only enables it from 2M up.
 - In-kernel one-shot: the fused kernel pushes 8 small packets per thread, so below ~256K the pull-based
   split version (110 / 416 µs) is faster; above it the 1-block fused kernel wins 2–2.5×.
-- `rdma` has a ~200 µs host-orchestration floor (eight event syncs, launches, CQ polling), so below ~256K
-  the in-kernel two-shot still wins. From 512K up RDMA is 1.8–32× faster than the best in-kernel variant.
-  The one-shot over RDMA (one exchange, one host round-trip) is the fastest NVFP4 variant at 128K–512K;
-  the two-shot RDMA overtakes it at 8M because it moves 3.5× fewer bytes.
-- `ce` (56 concurrent `cudaMemcpyPeerAsync`) tops out at 9–10 GB/s per rank and never beats `rdma`.
+- `rdma` has a ~160 µs host-orchestration floor (eight event syncs, launches, CQ polling), so below ~256K
+  the in-kernel two-shot still wins. From 512K up RDMA is 2.2–34× faster than the best in-kernel variant.
+  The one-shot over RDMA (one exchange, one host round-trip) is the fastest NVFP4 variant at 512K and
+  within 12 % of the in-kernel two-shot at 128K; the two-shot RDMA overtakes it at 8M (3.5× fewer bytes).
+- `ce` (56 concurrent `cudaMemcpyPeerAsync`) tops out at 9–11 GB/s per rank and never beats `rdma`.
 - Accuracy: `ce` and `rdma` are bit-identical; `sm` differs in the 4th digit (reduction order).
 
 ### 4.2 PCIe — RTX PRO 6000 Blackwell SE, 8 GPUs, sm_120, locked 2295–2347 MHz (µs)
@@ -517,13 +518,38 @@ rank (wire bytes: two-shot 2 × 7/8 × 0.5625 × numel, one-shot 7 × 0.5625 × 
 
 | numel | two-shot `sm` | two-shot `ce` | **two-shot `rdma`** | one-shot `rdma` |
 |---:|---:|---:|---:|---:|
-| 32K | 0.9 GB/s | 0.1 | 0.1 | 1.1 |
-| 128K | 1.3 | 0.2 | 0.6 | 4.1 |
-| 512K | 1.3 | 0.9 | 2.3 | 13.4 |
-| 8M | 1.0 | 7.9 | **21.4** | **39.7** |
-| 32M | 1.0 | 10.4 | **32.5** | — |
+| 32K | 0.9 GB/s | 0.1 | 0.2 | 1.3 |
+| 128K | 1.3 | 0.3 | 0.8 | 4.8 |
+| 512K | 1.3 | 1.1 | 3.0 | 14.9 |
+| 8M | 1.0 | 9.2 | **24.2** | **40.8** |
+| 32M | 1.0 | 11.1 | **34.4** | **42.7** |
 
-RDMA two-shot phase breakdown at 8M (host clock, µs): quantize+sync 62 · RS writes+CQ 122 · reduce+sync 45 ·
+**Transport knob sweep** (two-shot µs, 8 GPUs; one-shot in parentheses). `MERGE` = quantize straight into one
+contiguous slot per peer so each peer gets one WR / one copy instead of packed + scales separately; `PIPE` = post a
+rank's writes as soon as its quantize finishes and launch its reduce as soon as its inbox is full (host polls
+`cudaEventQuery` + CQs); `CHUNKS` = split each slice into k WRs; `RING` = staged copy-engine schedule with one
+inbound and one outbound copy per rank per step (event-chained).
+
+| config | 32K | 128K | 512K | 8M | 32M |
+|---|---:|---:|---:|---:|---:|
+| rdma baseline (2 WR/peer) | 213 (116) | 217 (129) | 220 (156) | 388 (832) | 1020 (3125) |
+| **rdma MERGE** (default) | **160** (98) | **166** (107) | **172** (139) | **341** (809) | **960** (3095) |
+| rdma PIPE | 226 (121) | 230 (150) | 233 (161) | 398 (840) | 999 (3110) |
+| rdma MERGE+PIPE | 185 (107) | 187 (118) | 187 (147) | 360 (815) | 964 (3090) |
+| rdma MERGE+PIPE, CHUNKS=2 | 210 (121) | 221 (125) | 216 (154) | 387 (839) | 1002 (3105) |
+| rdma MERGE+PIPE, CHUNKS=4 | 255 (144) | 256 (144) | 259 (175) | 407 (857) | 1181 (3120) |
+| ce baseline (2 copies/peer) | 551 (230) | 556 (229) | 551 (314) | 903 (3187) | 2976 (12083) |
+| **ce MERGE** (default) | **447** (248) | **451** (227) | **448** (290) | **898** (3358) | **2982** (12229) |
+| ce RING | 1187 (248) | 1213 (228) | 1187 (280) | 1290 (3298) | — |
+| ce MERGE+RING | 1746 (232) | 1730 (227) | 1728 (282) | 1525 (3351) | — |
+
+One WR per peer is worth 25 % at small sizes and 6–12 % at 8M–32M (half the doorbells and completions).
+Per-rank pipelining loses: with one host thread, polling eight events plus eight CQs costs more than the overlap
+it buys at this scale (a GPU-side doorbell would be the real fix). Splitting slices into more WRs only adds
+completions. For copy engines the staged ring is 2–3× slower — the cross-device event chain serialises the
+copies without raising per-copy bandwidth — so the flat all-pairs schedule stays.
+
+RDMA two-shot phase breakdown at 8M (host clock, µs, baseline config): quantize+sync 62 · RS writes+CQ 122 · reduce+sync 45 ·
 AG writes+CQ 122 · dequantize+sync 33 — the two write phases run at ~40 GB/s, everything else is the
 ~200 µs host-orchestration floor. One-shot at 8M: quantize+sync 58 · writes+CQ 736 · reduce+sync 37.
 Traffic never crosses the inter-socket link (GPU → local NIC → fabric → peer NIC → peer GPU), so NUMA
@@ -564,4 +590,4 @@ decode (PRMT or hardware cvt) fixes that, and after it the access pattern (§2.4
 5. Accuracy cost: rel_rmse 0.14 (NVFP4 two-shot, two quantization passes) / 0.10 (one-shot) vs 0.037 (FP8) vs 0.004 (BF16).
 7. TRT-LLM's `block_barrier` publishes its flag without a preceding `__syncthreads()`; on PCIe with many blocks this is a real race (its BF16 one-shot is non-deterministic there). The NVFP4 kernels add the `__syncthreads()`; `-DTRT_BARRIER_FIX` shows the fix on the verbatim kernels (§2.5).
 6. The E2M1 hardware `cvt` exists on every Blackwell including sm_120; build with explicit `-gencode …a`.
-8. **On PCIe hosts the wire, not the format, is the bottleneck.** SM stores across the root complex give ~1 GB/s per rank for every in-kernel all-reduce (ours and TRT-LLM's). Moving the NVFP4 slices with GPUDirect RDMA through the host's own NICs (FlashInfer PR #4876's recipe) reaches 32 GB/s per rank: 8M in 387 µs vs 7969 µs in-kernel, 14056 µs TRT-FP8 and 49559 µs TRT-BF16 (§4.6). The ~200 µs host-orchestration floor leaves the in-kernel kernel the winner below ~256K.
+8. **On PCIe hosts the wire, not the format, is the bottleneck.** SM stores across the root complex give ~1 GB/s per rank for every in-kernel all-reduce (ours and TRT-LLM's). Moving the NVFP4 slices with GPUDirect RDMA through the host's own NICs (FlashInfer PR #4876's recipe) reaches 34–43 GB/s per rank: 8M in 341 µs vs 7969 µs in-kernel, 14056 µs TRT-FP8 and 49833 µs TRT-BF16 (§4.1, §4.6). The ~160 µs host-orchestration floor leaves the in-kernel kernel the winner below ~256K.
