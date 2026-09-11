@@ -16,6 +16,7 @@ Files:
 | `nvfp4_allreduce.cuh` | standalone header: `launch_fused_rank<RANKS>()` (two-shot, recommended), `launch_oneshot_fused_rank<RANKS>()` (one-shot), `launch_twoshot_rank()` (split) |
 | `bench_ar.cu` | single-process harness, 8 GPUs in one node; all baselines + NVFP4; `PHASE=1` per-phase timing |
 | `bench_ar_mp.cu` | multi-process harness (one process per node, fabric handles + IMEX) for 2-node GB300 |
+| `bench_ar_pcie.cu` | PCIe wire transports for the same NVFP4 two-shot: in-kernel stores (`sm`) vs copy engines (`ce`) vs **GPUDirect RDMA through the host's own NICs** (`rdma`) |
 
 Headline (two-shot, 8 GPUs, clocks locked, µs; **fused NVFP4 vs TRT-LLM FP8**):
 
@@ -29,6 +30,7 @@ Headline (two-shot, 8 GPUs, clocks locked, µs; **fused NVFP4 vs TRT-LLM FP8**):
 vs TRT-LLM BF16 custom AR the fused NVFP4 kernel is 3.9–11.8× faster on NVLink (≥8M) and 2.3–6.3× on PCIe (best grid).
 **PCIe caveat:** TRT-FP8 with 1 block instead of its fixed 16 is up to 2.6× faster on the 6000D; the PCIe ratios above give TRT-FP8 that best grid (§4.1).
 One-shot: the fused NVFP4 one-shot beats TRT-LLM's BF16 one-shot at every size on NVLink (1.1× on the 16 µs latency floor, 5–8× from 8M up) and 4.4–5.6× on PCIe.
+**PCIe wire transport (§4.6):** on the 8× RTX 6000D every in-kernel all-reduce — ours and TRT-LLM's — moves ~1 GB/s per rank because SM stores across the CPU root complex degrade to small PCIe transactions. Moving the same NVFP4 bytes with GPUDirect RDMA through the host's own NICs (one 400G port per GPU, RC QPs between ranks) reaches 32 GB/s per rank: **387 µs at 8M vs 7969 µs in-kernel, 14056 µs TRT-FP8 (best grid) and 49559 µs TRT-BF16**.
 Accuracy cost: rel_rmse 0.14 (two-shot, two quantization passes) / 0.10 (one-shot) vs 0.037 (FP8) vs 0.004 (BF16).
 
 ---
@@ -137,7 +139,26 @@ by 17–31 % on B200/GB300. Per-phase timing (B200, 512M, 8 GPUs, µs) located i
 - Fusing into one kernel with TRT-LLM's `block_barrier` and PUSH reduce-scatter saves the separate
   quantize pass and the two barrier launches: another 7–18 % on NVLink, 1.5–2× on PCIe.
 
-### 2.5 A barrier race in TRT-LLM's `block_barrier` (and how the NVFP4 kernels avoid it)
+### 2.5 PCIe wire transports (`bench_ar_pcie.cu`)
+
+On a switch-free PCIe host every peer store issued by an SM crosses the CPU root complex and is broken
+into small transactions; that is why all in-kernel all-reduces in §4.1/§4.2 sit at ~1 GB/s per rank and
+why fewer blocks help. `bench_ar_pcie.cu` keeps the NVFP4 math (quantize → push → local reduce +
+requantize → push → dequantize) and swaps only the mechanism that moves bytes:
+
+- `sm`   — the fused kernel of §2.2 (reference).
+- `ce`   — `cudaMemcpyPeerAsync` for every slice, fully stream-ordered with cross-device events.
+- `rdma` — GPUDirect RDMA through the host's own NICs, following FlashInfer PR #4876's PCIe Ulysses
+  transport: each GPU is paired with the NIC on its PCIe bridge (chosen by sysfs path proximity, or
+  `NIC_MAP`), one RC QP per (rank, peer) over RoCE v2 (`RDMA_GID`, default 3), buffers registered with
+  `nvidia-peermem` (dma-buf fallback), `RDMA_WRITE` for the packed slice and `RDMA_WRITE_WITH_IMM` for
+  the scales so the receiver gets a completion, host polls all CQs between phases, and
+  `cudaDeviceFlushGPUDirectRDMAWrites` only if the device reports a weak write ordering. Everything is
+  one process; no MPI.
+
+Traffic never touches the inter-socket link: GPU → local NIC → fabric → peer's local NIC → peer GPU.
+
+### 2.6 A barrier race in TRT-LLM's `block_barrier` (and how the NVFP4 kernels avoid it)
 
 TRT-LLM's `block_barrier` has threads `tidx < world` publish the flag with `st.release.sys` **without a
 preceding `__syncthreads()`**, so the other threads of the block may still have data stores in flight
@@ -165,6 +186,13 @@ nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -DNRANKS=4 bench_ar.
 nvcc -gencode arch=compute_103a,code=sm_103a -O3 -std=c++17 -DNRANKS=8 bench_ar_mp.cu -o bench_ar_mp -lcuda # 2 nodes x 4 GPUs
 ```
 `NRANKS` is the number of GPUs the binary drives (TRT-LLM kernels are templated on it). `-DNRANKS=8` is the default.
+
+```bash
+# PCIe transports (needs rdma-core headers; run as a user that can load nvidia-peermem or has dma-buf)
+nvcc -gencode arch=compute_120a,code=sm_120a -O3 -std=c++17 -DNRANKS=8 bench_ar_pcie.cu -o bench_ar_pcie -lcuda -libverbs
+sudo modprobe nvidia-peermem
+AR_TRANSPORT=sm,ce,rdma NV_GRID=1 ./bench_ar_pcie <numel>     # RDMA_GID=<gid index>, NIC_MAP=2,3,0,1,6,7,4,5 to override
+```
 
 ### 3.2 Run
 
@@ -468,7 +496,28 @@ barrier traffic (blocks × ranks flag stores), fewer leave bandwidth idle; from 
 That is the default rule; it is within 4 % of the best at every size above. On PCIe the optimum is
 4 blocks regardless of size (§4.1, §4.2).
 
-### 4.6 Codec ablation (first version; what the codec did and did not change)
+### 4.6 PCIe wire transports — RTX 6000D, 8 GPUs, locked 2347 MHz (µs)
+
+Same NVFP4 two-shot math, three ways to move the bytes (`bench_ar_pcie.cu`, §2.5). Host: 2 sockets, GPUs
+0–3 / 4–7 on different NUMA nodes, one 400G RoCE port per GPU on its PCIe bridge; `ib_write_bw` GPU0→GPU4
+(cross-NUMA) 45.5 GB/s, `cudaMemcpyPeerAsync` GPU0→GPU4 50.5 GB/s. Wire bytes per rank = 2 × 7/8 × 0.5625 × numel.
+
+| numel | NVFP4 `sm` (1 blk) | NVFP4 `ce` | **NVFP4 `rdma`** | rdma GB/s per rank | rdma/sm | TRT-FP8 best (§4.1) | TRT-BF16 (§4.1) | **rdma vs TRT-FP8 / TRT-BF16** |
+|---:|---:|---:|---:|---:|:--:|---:|---:|:--:|
+| 32K | **35** | 547 | 230 | 0.1 | 0.15× | 215 | 99 | 0.93× / 0.43× |
+| 128K | **101** | 564 | 216 | 0.6 | 0.47× | 441 | 427 | 2.0× / 2.0× |
+| 512K | 402 | 551 | **221** | 2.3 | 1.8× | 1077 | 2164 | **4.9× / 9.8×** |
+| 8M | 8012 | 927 | **387** | 21.4 | **20.7×** | 14056 | 49559 | **36× / 128×** |
+| 32M | 32969 | 3172 | **1017** | 32.5 | **32×** | — | — | — |
+
+RDMA phase breakdown at 8M (host clock, µs): quantize+sync 62 · RS writes+CQ 122 · reduce+sync 45 ·
+AG writes+CQ 122 · dequantize+sync 33. The ~200 µs floor is host orchestration (eight `cudaEventSynchronize`,
+kernel launches, CQ polling), so below ~256K the in-kernel path still wins; from 512K up the NIC path is
+1.8–32× faster than the best in-kernel variant and 36× faster than TRT-LLM's FP8 kernel at its best grid.
+Copy engines top out at 9–10 GB/s per rank here: 56 concurrent peer copies contend on the root complexes.
+Accuracy is bit-identical between `ce` and `rdma` and within 1e-4 of `sm` (reduction order).
+
+### 4.7 Codec ablation (first version; what the codec did and did not change)
 
 | card | config | one-shot | two-shot |
 |---|---|---:|---:|
@@ -503,3 +552,4 @@ decode (PRMT or hardware cvt) fixes that, and after it the access pattern (§2.4
 5. Accuracy cost: rel_rmse 0.14 (NVFP4 two-shot, two quantization passes) / 0.10 (one-shot) vs 0.037 (FP8) vs 0.004 (BF16).
 7. TRT-LLM's `block_barrier` publishes its flag without a preceding `__syncthreads()`; on PCIe with many blocks this is a real race (its BF16 one-shot is non-deterministic there). The NVFP4 kernels add the `__syncthreads()`; `-DTRT_BARRIER_FIX` shows the fix on the verbatim kernels (§2.5).
 6. The E2M1 hardware `cvt` exists on every Blackwell including sm_120; build with explicit `-gencode …a`.
+8. **On PCIe hosts the wire, not the format, is the bottleneck.** SM stores across the root complex give ~1 GB/s per rank for every in-kernel all-reduce (ours and TRT-LLM's). Moving the NVFP4 slices with GPUDirect RDMA through the host's own NICs (FlashInfer PR #4876's recipe) reaches 32 GB/s per rank: 8M in 387 µs vs 7969 µs in-kernel, 14056 µs TRT-FP8 and 49559 µs TRT-BF16 (§4.6). The ~200 µs host-orchestration floor leaves the in-kernel kernel the winner below ~256K.
