@@ -502,13 +502,24 @@ Same NVFP4 two-shot math, three ways to move the bytes (`bench_ar_pcie.cu`, §2.
 0–3 / 4–7 on different NUMA nodes, one 400G RoCE port per GPU on its PCIe bridge; `ib_write_bw` GPU0→GPU4
 (cross-NUMA) 45.5 GB/s, `cudaMemcpyPeerAsync` GPU0→GPU4 50.5 GB/s. Wire bytes per rank = 2 × 7/8 × 0.5625 × numel.
 
-| numel | NVFP4 `sm` (1 blk) | NVFP4 `ce` | **NVFP4 `rdma`** | rdma GB/s per rank | rdma/sm | TRT-FP8 best (§4.1) | TRT-BF16 (§4.1) | **rdma vs TRT-FP8 / TRT-BF16** |
-|---:|---:|---:|---:|---:|:--:|---:|---:|:--:|
-| 32K | **35** | 547 | 230 | 0.1 | 0.15× | 215 | 99 | 0.93× / 0.43× |
-| 128K | **101** | 564 | 216 | 0.6 | 0.47× | 441 | 427 | 2.0× / 2.0× |
-| 512K | 402 | 551 | **221** | 2.3 | 1.8× | 1077 | 2164 | **4.9× / 9.8×** |
-| 8M | 8012 | 927 | **387** | 21.4 | **20.7×** | 14056 | 49559 | **36× / 128×** |
-| 32M | 32969 | 3172 | **1017** | 32.5 | **32×** | — | — | — |
+Table A — the same NVFP4 two-shot, three ways to move the bytes (µs; `rdma` column also as GB/s per rank):
+
+| numel | in-kernel `sm` (1 block) | copy engine `ce` | **RDMA `rdma`** | RDMA GB/s per rank |
+|---:|---:|---:|---:|---:|
+| 32K | **35** | 547 | 230 | 0.1 |
+| 128K | **101** | 564 | 216 | 0.6 |
+| 512K | 402 | 551 | **221** | 2.3 |
+| 8M | 8012 | 927 | **387** | 21.4 |
+| 32M | 32969 | 3172 | **1017** | 32.5 |
+
+Table B — fastest NVFP4 transport vs TRT-LLM on the same box (µs; TRT numbers from §4.1, TRT-FP8 at its best grid):
+
+| numel | TRT-BF16 | TRT-FP8 | **fastest NVFP4** (transport) | NVFP4 vs TRT-FP8 | NVFP4 vs TRT-BF16 |
+|---:|---:|---:|---:|:--:|:--:|
+| 32K | 99 | 215 | **35** (sm) | **6.1×** | 2.8× |
+| 128K | 427 | 441 | **101** (sm) | **4.4×** | 4.2× |
+| 512K | 2164 | 1077 | **221** (rdma) | **4.9×** | 9.8× |
+| 8M | 49559 | 14056 | **387** (rdma) | **36×** | 128× |
 
 RDMA phase breakdown at 8M (host clock, µs): quantize+sync 62 · RS writes+CQ 122 · reduce+sync 45 ·
 AG writes+CQ 122 · dequantize+sync 33. The ~200 µs floor is host orchestration (eight `cudaEventSynchronize`,
