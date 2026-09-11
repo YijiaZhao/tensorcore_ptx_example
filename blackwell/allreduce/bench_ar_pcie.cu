@@ -70,11 +70,29 @@ __global__ void ag_dequant_kernel(const uint8_t* __restrict__ landing, size_t sl
         *reinterpret_cast<int4*>(&out[g+k*8])=pk.packed; }
 }
 
+// one-shot landing per rank: [world columns][L.total_bytes]; column c = rank c's whole quantized tensor -> reduce -> BF16 out
+__global__ void os_reduce_kernel(const uint8_t* __restrict__ landing, size_t col_bytes, Layout L, int world, float SF, __nv_bfloat16* __restrict__ out){
+    const size_t tid=size_t(blockIdx.x)*blockDim.x+threadIdx.x; if(tid>=L.numel/EPT32) return;
+    const size_t g=tid*EPT32; float acc[32];
+#pragma unroll
+    for(int i=0;i<32;i++) acc[i]=0.f;
+    const float invSF=recip_ftz(SF);
+    for(int r=0;r<world;r++){ uint8_t* col=const_cast<uint8_t*>(landing)+(size_t)r*col_bytes;
+        uint4 e=*reinterpret_cast<const uint4*>(L.packed(col)+g/2);
+        uint16_t s2=*reinterpret_cast<const uint16_t*>(L.scales(col)+g/SF_VEC_SIZE);
+        dq32_acc(e,s2,invSF,acc); }
+#pragma unroll
+    for(int k=0;k<4;k++){ Packed16 pk;
+#pragma unroll
+        for(int j=0;j<4;j++) pk.unpacked[j]=__floats2bfloat162_rn(acc[k*8+2*j],acc[k*8+2*j+1]);
+        *reinterpret_cast<int4*>(&out[g+k*8])=pk.packed; }
+}
+
 // ------------------------------------------------------------------ RDMA plumbing
 struct RdmaRank {
     ibv_context* ctx=nullptr; ibv_pd* pd=nullptr; ibv_cq* cq=nullptr;
     ibv_qp* qp[NRANKS]={};
-    ibv_mr *mr_payload=nullptr,*mr_rs=nullptr,*mr_reduced=nullptr,*mr_ag=nullptr;
+    ibv_mr *mr_payload=nullptr,*mr_rs=nullptr,*mr_reduced=nullptr,*mr_ag=nullptr,*mr_os=nullptr;
     ibv_gid gid{}; uint16_t lid=0; ibv_mtu mtu=IBV_MTU_1024; std::string nic;
     int pending_send=0, pending_recv=0;
 };
@@ -126,7 +144,8 @@ int main(int argc,char** argv){
     float amax=0; for(size_t i=0;i<numel;i++) amax=fmaxf(amax,fabsf(hin[0][i])); const float SF=(E2M1_MAX*448.f)/amax, SFr=SF/float(world);
 
     std::vector<__nv_bfloat16*> d_in(world),d_out(world);
-    std::vector<uint8_t*> d_payload(world),d_rs(world),d_reduced(world),d_ag(world),d_comm(world);
+    std::vector<uint8_t*> d_payload(world),d_rs(world),d_reduced(world),d_ag(world),d_comm(world),d_os(world),d_comm1(world);
+    std::vector<uint32_t*> d_b1(world); std::vector<uint8_t**> pp_comm1(world); std::vector<uint32_t**> pp_b1(world);
     std::vector<uint32_t*> d_bin(world),d_bout(world); std::vector<uint8_t**> pp_comm(world); std::vector<uint32_t**> pp_bin(world),pp_bout(world);
     std::vector<cudaStream_t> st(world); std::vector<cudaEvent_t> ev_a(world),ev_b(world),ev_c(world);
     const size_t commB=fused_comm_bytes(shard,world), barW=fused_barrier_words(world);
@@ -137,24 +156,43 @@ int main(int argc,char** argv){
         CUDA_CHECK(cudaMalloc(&d_payload[r],L.total_bytes)); CUDA_CHECK(cudaMalloc(&d_rs[r],slot*world)); CUDA_CHECK(cudaMemset(d_rs[r],0,slot*world));
         CUDA_CHECK(cudaMalloc(&d_reduced[r],slot)); CUDA_CHECK(cudaMalloc(&d_ag[r],slot*world)); CUDA_CHECK(cudaMemset(d_ag[r],0,slot*world));
         CUDA_CHECK(cudaMalloc(&d_comm[r],commB)); CUDA_CHECK(cudaMemset(d_comm[r],0,commB));
+        CUDA_CHECK(cudaMalloc(&d_os[r],L.total_bytes*world)); CUDA_CHECK(cudaMemset(d_os[r],0,L.total_bytes*world));
+        CUDA_CHECK(cudaMalloc(&d_comm1[r],oneshot_comm_bytes(numel,world))); CUDA_CHECK(cudaMemset(d_comm1[r],0,oneshot_comm_bytes(numel,world)));
+        CUDA_CHECK(cudaMalloc(&d_b1[r],barW*4)); CUDA_CHECK(cudaMemset(d_b1[r],0,barW*4));
         CUDA_CHECK(cudaMalloc(&d_bin[r],barW*4)); CUDA_CHECK(cudaMemset(d_bin[r],0,barW*4)); CUDA_CHECK(cudaMalloc(&d_bout[r],barW*4)); CUDA_CHECK(cudaMemset(d_bout[r],0,barW*4));
         std::vector<__nv_bfloat16> tmp(numel); for(size_t i=0;i<numel;i++) tmp[i]=__float2bfloat16(hin[r][i]);
         CUDA_CHECK(cudaMemcpy(d_in[r],tmp.data(),numel*2,cudaMemcpyHostToDevice)); }
     for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r));
         CUDA_CHECK(cudaMalloc(&pp_comm[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_comm[r],d_comm.data(),world*8,cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMalloc(&pp_bin[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_bin[r],d_bin.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_bout[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_bout[r],d_bout.data(),world*8,cudaMemcpyHostToDevice)); }
+        CUDA_CHECK(cudaMalloc(&pp_bout[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_bout[r],d_bout.data(),world*8,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&pp_comm1[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_comm1[r],d_comm1.data(),world*8,cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMalloc(&pp_b1[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_b1[r],d_b1.data(),world*8,cudaMemcpyHostToDevice)); }
     auto sync_all=[&](){ for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r)); CUDA_CHECK(cudaDeviceSynchronize()); } };
     auto rel_rmse=[&](int r){ std::vector<__nv_bfloat16> h(numel); CUDA_CHECK(cudaSetDevice(r)); CUDA_CHECK(cudaMemcpy(h.data(),d_out[r],numel*2,cudaMemcpyDeviceToHost));
         double s=0,sr=0; for(size_t i=0;i<numel;i++){ double e=__bfloat162float(h[i])-ref[i]; s+=e*e; sr+=double(ref[i])*ref[i]; } return sqrt(s/(sr+1e-12)); };
     const int grid_q=int((numel/ELTS_PER_THREAD+TPB-1)/TPB), grid_rs=int((shard/EPT32+TPB-1)/TPB), grid_ag=int((numel/EPT32+TPB-1)/TPB);
     int g_sm=getenv("NV_GRID")?atoi(getenv("NV_GRID")):1;   // PCIe optimum for the in-kernel transport
+    int g_sm1=getenv("NV_GRID1")?atoi(getenv("NV_GRID1")):1;
     const bool big=numel>=(size_t(1)<<23); const int WARMUP=big?3:10, ITERS=big?10:50;
     printf("world=%d numel=%zu shard=%zu  NVFP4 slot/rank=%zu B  transports=%s\n",world,numel,shard,slot,transports.c_str());
 
     // ================= sm: fused in-kernel transport =================
     uint32_t flag=1;
     auto run_sm=[&](){ for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r)); launch_fused_rank<NRANKS>(d_in[r],d_out[r],pp_comm[r],pp_bin[r],pp_bout[r],r,numel,SF,flag,st[r],TPB,g_sm); } flag++; };
+
+    uint32_t flag1=1;
+    auto run_sm1=[&](){ for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r)); launch_oneshot_fused_rank<NRANKS>(d_in[r],d_out[r],pp_comm1[r],pp_b1[r],r,numel,SF,flag1,st[r],TPB,g_sm1); } flag1++; };
+    // ce one-shot: quantize, push whole payload to every peer's column, wait all, local reduce
+    auto run_ce1=[&](){
+        for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r)); quantize_kernel<<<grid_q,TPB,0,st[r]>>>(d_in[r],d_payload[r],L,SF);
+            for(int p=0;p<world;p++){ uint8_t* dst=d_os[p]+(size_t)r*L.total_bytes;
+                if(p==r) CUDA_CHECK(cudaMemcpyAsync(dst,d_payload[r],L.total_bytes,cudaMemcpyDeviceToDevice,st[r]));
+                else CUDA_CHECK(cudaMemcpyPeerAsync(dst,p,d_payload[r],r,L.total_bytes,st[r])); }
+            CUDA_CHECK(cudaEventRecord(ev_a[r],st[r])); }
+        for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r)); for(int p=0;p<world;p++) if(p!=r) CUDA_CHECK(cudaStreamWaitEvent(st[r],ev_a[p],0));
+            os_reduce_kernel<<<grid_ag,TPB,0,st[r]>>>(d_os[r],L.total_bytes,L,world,SF,d_out[r]); }
+    };
 
     // ================= ce: copy-engine transport, stream-ordered =================
     auto run_ce=[&](){
@@ -209,7 +247,7 @@ int main(int argc,char** argv){
             if(ord<cudaGPUDirectRDMAWritesOrderingOwner) need_flush=true;
             const int acc=IBV_ACCESS_LOCAL_WRITE|IBV_ACCESS_REMOTE_WRITE|IBV_ACCESS_REMOTE_READ;
             R.mr_payload=reg_gpu_mr(R.pd,d_payload[r],L.total_bytes,acc); R.mr_rs=reg_gpu_mr(R.pd,d_rs[r],slot*world,acc);
-            R.mr_reduced=reg_gpu_mr(R.pd,d_reduced[r],slot,acc); R.mr_ag=reg_gpu_mr(R.pd,d_ag[r],slot*world,acc);
+            R.mr_reduced=reg_gpu_mr(R.pd,d_reduced[r],slot,acc); R.mr_ag=reg_gpu_mr(R.pd,d_ag[r],slot*world,acc); R.mr_os=reg_gpu_mr(R.pd,d_os[r],L.total_bytes*world,acc);
             for(int p=0;p<world;p++){ if(p==r) continue; ibv_qp_init_attr qa{}; qa.send_cq=R.cq; qa.recv_cq=R.cq; qa.qp_type=IBV_QPT_RC;
                 qa.cap.max_send_wr=64; qa.cap.max_recv_wr=64; qa.cap.max_send_sge=1; qa.cap.max_recv_sge=1;
                 R.qp[p]=ibv_create_qp(R.pd,&qa); IBV_CHECK(R.qp[p],"ibv_create_qp");
@@ -259,11 +297,34 @@ int main(int argc,char** argv){
         if(timed){ t_rd_q+=t1-t0; t_rd_rs+=t2-t1; t_rd_red+=t3-t2; t_rd_ag+=t4-t3; t_rd_dq+=t5-t4; rd_iters++; }
     };
 
+    double t_r1_q=0,t_r1_w=0,t_r1_red=0; int r1_iters=0;
+    auto run_rdma1=[&](bool timed){
+        double t0=now();
+        for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r)); quantize_kernel<<<grid_q,TPB,0,st[r]>>>(d_in[r],d_payload[r],L,SF);
+            CUDA_CHECK(cudaMemcpyAsync(d_os[r]+(size_t)r*L.total_bytes,d_payload[r],L.total_bytes,cudaMemcpyDeviceToDevice,st[r])); CUDA_CHECK(cudaEventRecord(ev_a[r],st[r])); }
+        for(int r=0;r<world;r++) for(int p=0;p<world;p++) if(p!=r) post_recv(RR[r],p);
+        for(int r=0;r<world;r++) CUDA_CHECK(cudaEventSynchronize(ev_a[r]));
+        double t1=now();
+        for(int r=0;r<world;r++) for(int p=0;p<world;p++){ if(p==r) continue; RdmaRank& R=RR[r];
+            uint64_t base=(uint64_t)d_os[p]+(uint64_t)r*L.total_bytes; uint32_t rkey=RR[p].mr_os->rkey;
+            post_write(R,p,R.mr_payload,L.packed(d_payload[r]),numel/2,base,rkey,false);
+            post_write(R,p,R.mr_payload,L.scales(d_payload[r]),numel/SF_VEC_SIZE,base+numel/2,rkey,true); }
+        drain(RR); flush_all();
+        double t2=now();
+        for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r)); os_reduce_kernel<<<grid_ag,TPB,0,st[r]>>>(d_os[r],L.total_bytes,L,world,SF,d_out[r]); CUDA_CHECK(cudaEventRecord(ev_c[r],st[r])); }
+        for(int r=0;r<world;r++) CUDA_CHECK(cudaEventSynchronize(ev_c[r]));
+        double t3=now();
+        if(timed){ t_r1_q+=t1-t0; t_r1_w+=t2-t1; t_r1_red+=t3-t2; r1_iters++; }
+    };
+
     // ---- correctness ----
     printf("correctness (rank 0 / rank %d):\n",world-1);
     if(want("sm"))  { run_sm(); sync_all(); printf("  NVFP4 sm    rel_rmse=%.6f / %.6f\n",rel_rmse(0),rel_rmse(world-1)); }
     if(want("ce"))  { run_ce(); sync_all(); printf("  NVFP4 ce    rel_rmse=%.6f / %.6f\n",rel_rmse(0),rel_rmse(world-1)); }
     if(rdma_ok)     { run_rdma(false); sync_all(); printf("  NVFP4 rdma  rel_rmse=%.6f / %.6f\n",rel_rmse(0),rel_rmse(world-1)); }
+    if(want("sm"))  { run_sm1(); sync_all(); printf("  NVFP4 one-shot sm    rel_rmse=%.6f / %.6f\n",rel_rmse(0),rel_rmse(world-1)); }
+    if(want("ce"))  { run_ce1(); sync_all(); printf("  NVFP4 one-shot ce    rel_rmse=%.6f / %.6f\n",rel_rmse(0),rel_rmse(world-1)); }
+    if(rdma_ok)     { run_rdma1(false); sync_all(); printf("  NVFP4 one-shot rdma  rel_rmse=%.6f / %.6f\n",rel_rmse(0),rel_rmse(world-1)); }
 
     // ---- timing (device events on rank 0 for stream-ordered transports; host wall clock for rdma) ----
     auto time_dev=[&](auto fn)->double{ for(int i=0;i<WARMUP;i++) fn(); sync_all(); cudaSetDevice(0); cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
@@ -272,6 +333,10 @@ int main(int argc,char** argv){
     if(want("sm")) t_sm=time_dev(run_sm);
     if(want("ce")) t_ce=time_dev(run_ce);
     if(rdma_ok){ for(int i=0;i<WARMUP;i++) run_rdma(false); sync_all(); double a=now(); for(int i=0;i<ITERS;i++) run_rdma(true); sync_all(); t_rd=(now()-a)/ITERS; }
+    double t1_sm=-1,t1_ce=-1,t1_rd=-1;
+    if(want("sm")) t1_sm=time_dev(run_sm1);
+    if(want("ce")) t1_ce=time_dev(run_ce1);
+    if(rdma_ok){ for(int i=0;i<WARMUP;i++) run_rdma1(false); sync_all(); double a=now(); for(int i=0;i<ITERS;i++) run_rdma1(true); sync_all(); t1_rd=(now()-a)/ITERS; }
     const double wire_bytes=2.0*(world-1)*(shard/2.0+shard/(double)SF_VEC_SIZE);   // per rank, RS push + AG push
     printf("TIMING us/allreduce (two-shot NVFP4, %d GPUs):", world);
     if(t_sm>0) printf("  sm=%.1f (grid %d, %.1f GB/s/rank)",t_sm,g_sm,wire_bytes/t_sm*1e-3);
@@ -281,5 +346,9 @@ int main(int argc,char** argv){
     if(t_rd>0&&rd_iters) printf("  rdma phases (host, us): quant+sync=%.1f  RS-write+cq=%.1f  reduce+sync=%.1f  AG-write+cq=%.1f  dequant+sync=%.1f\n",
         t_rd_q/rd_iters,t_rd_rs/rd_iters,t_rd_red/rd_iters,t_rd_ag/rd_iters,t_rd_dq/rd_iters);
     if(t_sm>0&&t_ce>0) printf("  ce/sm speedup=%.2fx",t_sm/t_ce); if(t_sm>0&&t_rd>0) printf("  rdma/sm speedup=%.2fx",t_sm/t_rd); if(t_ce>0&&t_rd>0) printf("  rdma/ce=%.2fx",t_ce/t_rd); printf("\n");
+    const double wire1=(double)(world-1)*L.total_bytes;   // per rank, one-shot push to every peer
+    printf("ONE-SHOT us/allreduce (NVFP4, %d GPUs):", world);
+    if(t1_sm>0) printf("  sm=%.1f (grid %d)",t1_sm,g_sm1); if(t1_ce>0) printf("  ce=%.1f (%.1f GB/s/rank)",t1_ce,wire1/t1_ce*1e-3); if(t1_rd>0) printf("  rdma=%.1f (%.1f GB/s/rank)",t1_rd,wire1/t1_rd*1e-3); printf("\n");
+    if(t1_rd>0&&r1_iters) printf("  one-shot rdma phases (host, us): quant+sync=%.1f  write+cq=%.1f  reduce+sync=%.1f\n",t_r1_q/r1_iters,t_r1_w/r1_iters,t_r1_red/r1_iters);
     return 0;
 }
