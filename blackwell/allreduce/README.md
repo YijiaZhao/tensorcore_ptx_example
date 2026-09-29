@@ -30,7 +30,7 @@ Headline (two-shot, 8 GPUs, clocks locked, µs; **fused NVFP4 vs TRT-LLM FP8**):
 vs TRT-LLM BF16 custom AR the fused NVFP4 kernel is 3.9–11.8× faster on NVLink (≥8M) and 2.3–6.3× on PCIe (best grid).
 **PCIe caveat:** TRT-FP8 with 1 block instead of its fixed 16 is up to 2.6× faster on the 6000D; the PCIe ratios above give TRT-FP8 that best grid (§4.1).
 One-shot: the fused NVFP4 one-shot beats TRT-LLM's BF16 one-shot at every size on NVLink (1.1× on the 16 µs latency floor, 5–8× from 8M up) and 4.4–5.6× on PCIe.
-**PCIe wire transport (§2.5, §4.1, §4.6):** on the 8× RTX 6000D every in-kernel all-reduce — ours and TRT-LLM's — moves ~1 GB/s per rank because SM stores across the CPU root complex degrade to small PCIe transactions. Moving the same NVFP4 bytes with GPUDirect RDMA through the host's own NICs (one 400G port per GPU, RC QPs between ranks) reaches 34–43 GB/s per rank: two-shot **341 µs at 8M vs 7969 µs in-kernel, 14056 µs TRT-FP8 (best grid) and 49833 µs TRT-BF16**; one-shot 809 µs vs 158265 µs TRT-BF16 one-shot.
+**PCIe wire transport (§2.5, §4.1, §4.6):** on the 8× RTX 6000D every in-kernel all-reduce — ours and TRT-LLM's — moves ~1 GB/s per rank. This is a property of the 8-way all-to-all kernel pattern on a switch-less host, not of SM peer access itself: a single-pair SM push reaches 45 GB/s cross-socket (`../comm_primitives/minimal_p2p_copy_engine.cu`, §4.6). Moving the same NVFP4 bytes with GPUDirect RDMA through the host's own NICs (one 400G port per GPU, RC QPs between ranks) reaches 34–43 GB/s per rank: two-shot **341 µs at 8M vs 7969 µs in-kernel, 14056 µs TRT-FP8 (best grid) and 49833 µs TRT-BF16**; one-shot 809 µs vs 158265 µs TRT-BF16 one-shot.
 Accuracy cost: rel_rmse 0.14 (two-shot, two quantization passes) / 0.10 (one-shot) vs 0.037 (FP8) vs 0.004 (BF16).
 
 ---
@@ -141,9 +141,13 @@ by 17–31 % on B200/GB300. Per-phase timing (B200, 512M, 8 GPUs, µs) located i
 
 ### 2.5 PCIe wire transports (`bench_ar_pcie.cu`)
 
-On a switch-free PCIe host every peer store issued by an SM crosses the CPU root complex and is broken
-into small transactions; that is why all in-kernel all-reduces in §4.1/§4.2 sit at ~1 GB/s per rank and
-why fewer blocks help. `bench_ar_pcie.cu` keeps the NVFP4 math (quantize → push → local reduce +
+On this switch-free PCIe host every in-kernel all-reduce in §4.1/§4.2 sits at ~1 GB/s per rank, and fewer
+blocks help. The cause is NOT that SM peer stores are slow per se — a single GPU pair pushing with
+`st.global` reaches 45 GB/s cross-socket at 4–16 blocks (§4.6). What the all-reduce adds is 8 GPUs writing
+to all 7 peers at once through one root complex, remote *loads* in the all-gather phase (round trips,
+2–4 GB/s at 1 block), 2-byte scale stores next to every 16-byte store, and in-kernel barriers; the
+combination is what collapses to ~1 GB/s, and a better-scheduled SM kernel is an open item.
+`bench_ar_pcie.cu` keeps the NVFP4 math (quantize → push → local reduce +
 requantize → push → dequantize) and swaps only the mechanism that moves bytes:
 
 - `sm`   — the fused kernel of §2.2 (reference).
@@ -512,9 +516,20 @@ That is the default rule; it is within 4 % of the best at every size above. On P
 ### 4.6 PCIe wire transports — what the NIC path actually delivers (RTX 6000D)
 
 Host: 2 sockets, GPUs 0–3 / 4–7 on different NUMA nodes, one 400G RoCE port per GPU on its PCIe bridge.
-Raw link probes: `ib_write_bw` GPU0→GPU4 (cross-NUMA, GPUDirect) 45.5 GB/s; `cudaMemcpyPeerAsync` GPU0→GPU4
-50.5 GB/s; the in-kernel all-reduces of §4.1 move ~1 GB/s per rank. Achieved all-reduce wire bandwidth per
-rank (wire bytes: two-shot 2 × 7/8 × 0.5625 × numel, one-shot 7 × 0.5625 × numel; times from §4.1):
+Raw link probes, one GPU pair at a time, 64 MB (`../comm_primitives/minimal_p2p_copy_engine.cu`,
+`minimal_p2p_rdma_write.cu`; 3 runs each, range shown):
+
+| GPU0 → | Copy Engine | SM push `st.global` (blocks) | SM pull `ld.global` (blocks) | GPUDirect RDMA (`ib_write_bw` / ours) |
+|---|---:|---:|---:|---:|
+| GPU1 (same bridge) | 36–57 GB/s | 8–21 (1) · 18–29 (4) · 24–30 (16) · 24–51 (64) · 24 (1024) | 2–4 (1) · 6–8 (4) · 22–31 (16) · 23–51 (64) | — / 47.8 |
+| GPU4 (cross socket) | 45 (6–12 in two noisy runs) | 4–6 (1) · **45** (4) · 22–45 (16) · 22–42 (64) · 20–45 (1024) | 2 (1) · 10 (4) · 16–39 (16) · 15 (64–1024) | 45.5 / 47.7 |
+
+So on this host a single SM pusher matches the copy engine once it has 4–16 blocks in flight; remote
+loads need ≥16 blocks and never fully catch up cross-socket; 1 block is latency-bound for both. With
+all 8 GPUs pushing at once (ring i→i+1) per-pair SM push drops to 20–50 GB/s and cross-socket pairs
+(i→i+4, four in each direction) to 4–6 GB/s in the 0–3→4–7 direction, 17–30 GB/s the other way. The
+in-kernel all-reduces of §4.1 move ~1 GB/s per rank. Achieved all-reduce wire bandwidth per rank (wire
+bytes: two-shot 2 × 7/8 × 0.5625 × numel, one-shot 7 × 0.5625 × numel; times from §4.1):
 
 | numel | two-shot `sm` | two-shot `ce` | **two-shot `rdma`** | one-shot `rdma` |
 |---:|---:|---:|---:|---:|
