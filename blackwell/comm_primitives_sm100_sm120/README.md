@@ -1,8 +1,15 @@
-# comm_primitives — how bytes get from one GPU to another, one primitive per file
+# comm_primitives_sm100_sm120 — how bytes get from one GPU to another, one primitive per file
 
 Minimal, single-process examples of every data-movement path a GPU has. Each file is
 self-contained and prints a pass/fail plus, where it makes sense, a bandwidth. The
 complete all-reduce built from these lives in `../allreduce/`.
+
+The `sm100_sm120` suffix groups the Blackwell examples; it does **not** mean every
+primitive is exclusive to, or verified on, both SM100 and SM120. Some PTX works
+on sm_90+, while peer access, multicast, and RDMA additionally depend on the
+GPU, interconnect, and NIC. Build device code for the actual GPU (for example,
+`-arch=sm_100a` on B200 or `-arch=sm_120a` on supported SM120 hardware);
+the build commands below are examples, not cross-architecture binaries.
 
 | file | who moves the bytes | instruction / API | needs |
 |---|---|---|---|

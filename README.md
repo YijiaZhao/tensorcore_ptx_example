@@ -143,7 +143,7 @@ blackwell/                          sm_100a (tcgen05) + sm_120a (mma.sync 扩展
   tcgen05_fp4_sm100/                nvfp4/mxfp4 + maxtile + cta_group::2 + warp数实验
   warp_specialization_sm100/        sm_100a/103a: tcgen05 + TMEM, LDGSTS/TMA multistage
   warp_specialization_sm120/        sm_120a: mma.sync NVFP4, LDGSTS/TMA multistage
-  comm_primitives/                  GPU 间搬数据的原语最小例: SM ld/st P2P, acq/rel flag, TMA, multimem, Copy Engine, GPUDirect RDMA
+  comm_primitives_sm100_sm120/                  GPU 间搬数据的原语最小例: SM ld/st P2P, acq/rel flag, TMA, multimem, Copy Engine, GPUDirect RDMA
                                     (完整的 all-reduce 在 allreduce/)
   ptx_inline_asm_shl_demo.cu        PTX 内联汇编入门 (与 tensor core 无关)
 ```
@@ -250,9 +250,9 @@ cuobjdump -sass x.cubin | grep -oE "(H|Q|I)G?MMA[A-Z0-9._]*|F2FP[A-Z0-9._]*|IMAD
 | blackwell mma.sync (sm_120, 含 fp4/mxfp8/原生fp8) | ✅ RTX PRO 6000 Blackwell | ✅ QMMA.SF 等 |
 | hopper wgmma + mma.sync 全部 | ✅ H20 | ✅ |
 | ada 全部 (原生 fp8 QMMA + 末代 int4 IMMA.S4) | ✅ L40 | ✅ 全原生单指令 |
-| comm_primitives/ P2P + TMA | ✅ GB200 ×4 | — |
-| comm_primitives/ Copy Engine + GPUDirect RDMA | ✅ RTX 6000D ×8 (PCIe, 400G RoCE) | — |
-| comm_primitives/ multimem (需 NVSwitch multicast) | ✅ B200 ×8 (NVL4 小机型不支持, check 工具可探测) | — |
+| comm_primitives_sm100_sm120/ P2P + TMA | ✅ GB200 ×4 | — |
+| comm_primitives_sm100_sm120/ Copy Engine + GPUDirect RDMA | ✅ RTX 6000D ×8 (PCIe, 400G RoCE) | — |
+| comm_primitives_sm100_sm120/ multimem (需 NVSwitch multicast) | ✅ B200 ×8 (NVL4 小机型不支持, check 工具可探测) | — |
 
 SASS 检查方法: `cuobjdump -sass x.cubin | grep -E "MMA|GMMA|F2FP|IMAD.SHL"`
 （看到 F2FP/IMAD.SHL 前奏 = 模拟路径; 单条 *MMA = 原生）

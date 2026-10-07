@@ -30,7 +30,7 @@ Headline (two-shot, 8 GPUs, clocks locked, µs; **fused NVFP4 vs TRT-LLM FP8**):
 vs TRT-LLM BF16 custom AR the fused NVFP4 kernel is 3.9–11.8× faster on NVLink (≥8M) and 2.3–6.3× on PCIe (best grid).
 **PCIe caveat:** TRT-FP8 with 1 block instead of its fixed 16 is up to 2.6× faster on the 6000D; the PCIe ratios above give TRT-FP8 that best grid (§4.1).
 One-shot: the fused NVFP4 one-shot beats TRT-LLM's BF16 one-shot at every size on NVLink (1.1× on the 16 µs latency floor, 5–8× from 8M up) and 4.4–5.6× on PCIe.
-**PCIe wire transport (§2.5, §4.1, §4.6):** on the 8× RTX 6000D every in-kernel all-reduce — ours and TRT-LLM's — moves ~1 GB/s per rank. This is a property of the 8-way all-to-all kernel pattern on a switch-less host, not of SM peer access itself: a single-pair SM push reaches 45 GB/s cross-socket (`../comm_primitives/minimal_p2p_copy_engine.cu`, §4.6). Moving the same NVFP4 bytes with GPUDirect RDMA through the host's own NICs (one 400G port per GPU, RC QPs between ranks) reaches 34–43 GB/s per rank: two-shot **341 µs at 8M vs 7969 µs in-kernel, 14056 µs TRT-FP8 (best grid) and 49833 µs TRT-BF16**; one-shot 809 µs vs 158265 µs TRT-BF16 one-shot.
+**PCIe wire transport (§2.5, §4.1, §4.6):** on the 8× RTX 6000D every in-kernel all-reduce — ours and TRT-LLM's — moves ~1 GB/s per rank. This is a property of the 8-way all-to-all kernel pattern on a switch-less host, not of SM peer access itself: a single-pair SM push reaches 45 GB/s cross-socket (`../comm_primitives_sm100_sm120/minimal_p2p_copy_engine.cu`, §4.6). Moving the same NVFP4 bytes with GPUDirect RDMA through the host's own NICs (one 400G port per GPU, RC QPs between ranks) reaches 34–43 GB/s per rank: two-shot **341 µs at 8M vs 7969 µs in-kernel, 14056 µs TRT-FP8 (best grid) and 49833 µs TRT-BF16**; one-shot 809 µs vs 158265 µs TRT-BF16 one-shot.
 Accuracy cost: rel_rmse 0.14 (two-shot, two quantization passes) / 0.10 (one-shot) vs 0.037 (FP8) vs 0.004 (BF16).
 
 ---
@@ -516,7 +516,7 @@ That is the default rule; it is within 4 % of the best at every size above. On P
 ### 4.6 PCIe wire transports — what the NIC path actually delivers (RTX 6000D)
 
 Host: 2 sockets, GPUs 0–3 / 4–7 on different NUMA nodes, one 400G RoCE port per GPU on its PCIe bridge.
-Raw link probes, one GPU pair at a time, 64 MB (`../comm_primitives/minimal_p2p_copy_engine.cu`,
+Raw link probes, one GPU pair at a time, 64 MB (`../comm_primitives_sm100_sm120/minimal_p2p_copy_engine.cu`,
 `minimal_p2p_rdma_write.cu`; 3 runs each, range shown):
 
 | GPU0 → | Copy Engine | SM push `st.global` (blocks) | SM pull `ld.global` (blocks) | GPUDirect RDMA (`ib_write_bw` / ours) |
