@@ -9,7 +9,7 @@
 ada/       sm_89        (L40S / RTX 40)
 hopper/    sm_90a       (H100 / H20)
 blackwell/ sm_100a+120a (B200 / RTX 6000D)
-  blackwell/allreduce/  NVFP4 all-reduce vs TRT-LLM BF16/FP8 custom AR (5 Blackwell GPU types, 8 GPUs each, PCIe+NVLink incl. 2-node GB300, recipes + results)
+  blackwell/allreduce_sm100_sm120/  NVFP4 all-reduce vs TRT-LLM BF16/FP8 custom AR (5 Blackwell GPU types, 8 GPUs each, PCIe+NVLink incl. 2-node GB300, recipes + results)
 ```
 
 ---
@@ -144,7 +144,7 @@ blackwell/                          sm_100a (tcgen05) + sm_120a (mma.sync 扩展
   warp_specialization_sm100/        sm_100a/103a: tcgen05 + TMEM, LDGSTS/TMA multistage
   warp_specialization_sm120/        sm_120a: mma.sync NVFP4, LDGSTS/TMA multistage
   comm_primitives_sm100_sm120/                  GPU 间搬数据的原语最小例: SM ld/st P2P, acq/rel flag, TMA, multimem, Copy Engine, GPUDirect RDMA
-                                    (完整的 all-reduce 在 allreduce/)
+                                    (完整的 all-reduce 在 allreduce_sm100_sm120/)
   ptx_inline_asm_shl_demo.cu        PTX 内联汇编入门 (与 tensor core 无关)
 ```
 

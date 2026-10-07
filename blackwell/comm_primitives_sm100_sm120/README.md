@@ -2,7 +2,7 @@
 
 Minimal, single-process examples of every data-movement path a GPU has. Each file is
 self-contained and prints a pass/fail plus, where it makes sense, a bandwidth. The
-complete all-reduce built from these lives in `../allreduce/`.
+complete all-reduce built from these lives in `../allreduce_sm100_sm120/`.
 
 The `sm100_sm120` suffix groups the Blackwell examples; it does **not** mean every
 primitive is exclusive to, or verified on, both SM100 and SM120. Some PTX works
@@ -54,5 +54,5 @@ nvcc -std=c++17 -O2 -arch=sm_100 -o minimal_p2p_rdma_write minimal_p2p_rdma_writ
 Take-aways: remote stores are posted and reach link speed with a handful of blocks; remote loads are
 round trips and need many more in flight; too many concurrent writers on a switch-less host hurt
 (root-complex contention). The copy engine and the NIC do not care about any of this. The
-all-reduce in `../allreduce/README.md` §4.6 shows how these single-pair numbers translate (or fail to)
+all-reduce in `../allreduce_sm100_sm120/README.md` §4.6 shows how these single-pair numbers translate (or fail to)
 into an 8-GPU collective.

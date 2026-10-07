@@ -1,5 +1,8 @@
 # NVFP4-compressed all-reduce vs TRT-LLM custom all-reduce (Blackwell)
 
+The `sm100_sm120` directory name groups the primary B200 (sm_100) and RTX (sm_120)
+implementations; this shared code is also benchmarked on GB300 (sm_103).
+
 An all-reduce that moves NVFP4 (E2M1 + per-16 UE4M3 block scale, 0.5625 B/elt) over the wire
 instead of BF16 (2 B/elt) or FP8 (TRT-LLM low-precision AR, ~1.06 B/elt), built on the exact
 kernel structure of TRT-LLM's `twoShotAllReduceKernel`, and benchmarked against **TRT-LLM's own
@@ -107,9 +110,16 @@ per-phase timing (`PHASE=1`).
 
 ### 2.3 Codec
 
-Hardware E2M1 conversion on every Blackwell (`cvt.rn.satfinite.e2m1x2.f32` encode on sm_100/101/103/120;
-`cvt.rn.f16x2.e2m1x2` decode on sm_100/103, PRMT register-LUT decode on sm_120 where the cvt pipe is
-slower). These are arch-specific ("a") features: **build with explicit
+E2M1 encoding uses hardware `cvt.rn.satfinite.e2m1x2.f32` on Blackwell. Both hardware
+`cvt.rn.f16x2.e2m1x2` and PRMT register-LUT decoding can run on sm_100 and sm_120;
+the default compile-time choice is `cvt` on sm_100/103 and PRMT on sm_120 based on
+this all-reduce's measurements (§4.7), **not** a lack of instruction support. On B200
+they were nearly tied (hardware `cvt` one-shot ~0.4% faster, two-shot ~0.04% slower);
+on RTX 6000D (sm_120), hardware `cvt` was 37% slower one-shot and 13% slower
+two-shot than PRMT. These are end-to-end timings, not standalone codec throughput.
+To compare the alternative on one GPU, change the `__CUDA_ARCH__` branch in the
+source and rebuild; there is no runtime switch. Hardware E2M1 conversions are
+arch-specific ("a") features: **build with explicit
 `-gencode arch=compute_XXXa,code=sm_XXXa`** — the `-arch=sm_XXXa` shorthand does not enable them in
 nvcc 13.x (ptxas "not supported on sm_XXX").
 

@@ -8,7 +8,7 @@
  * (ibv_post_send) and the NIC does the rest. Traffic never crosses the CPU
  * root complex when each GPU is paired with the NIC on its own PCIe bridge,
  * which is why this beats both SM stores and the Copy Engine on switch-less
- * PCIe hosts (see ../allreduce/README.md §4.6).
+ * PCIe hosts (see ../allreduce_sm100_sm120/README.md §4.6).
  *
  * What happens, in order:
  *   1. cudaMalloc on both GPUs; ibv_reg_mr registers the GPU memory with each NIC

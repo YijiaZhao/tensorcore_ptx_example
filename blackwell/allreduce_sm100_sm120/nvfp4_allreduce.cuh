@@ -145,8 +145,13 @@ __device__ __forceinline__ float ue4m3_to_float(uint8_t code) {
 // -----------------------------------------------------------------------------
 
 // decode8_e2m1: 8 E2M1 nibbles -> 8 floats.
-// Hardware cvt on sm_100/sm_103 (full-rate conversion pipe). On sm_120 the same cvt is
-// 13-37 % slower than the PRMT register table below, so sm_120 takes the #else branch.
+// Both hardware cvt.rn.f16x2.e2m1x2 and the PRMT register-LUT below work on
+// sm_100 and sm_120; this #if selects by measured end-to-end all-reduce performance,
+// not instruction availability. On B200 (sm_100) hardware cvt vs PRMT was nearly
+// tied (3862 -> 3846 us one-shot; 2671 -> 2672 us two-shot). On RTX 6000D (sm_120),
+// hardware cvt made one-shot 37% and two-shot 13% slower than PRMT. See README §4.7.
+// To compare the alternative on either architecture, change this compile-time branch
+// and rebuild for that device; there is no runtime dispatch.
 __device__ __forceinline__ void decode8_e2m1(uint32_t nibbles, float out[8]) {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000) && (__CUDA_ARCH__ < 1200)
     // One byte (2 nibbles) -> one f16x2; low nibble lands in .x.

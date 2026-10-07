@@ -215,10 +215,13 @@ __device__ __forceinline__ float ue4m3_to_float(uint8_t code){ __nv_fp8_e4m3 f; 
 //   then hardware e4m3x2 -> half2 -> float2. ~12 instr / 8 elts, works on every arch (sm_89+).
 //   kMagLo/Hi: e2m1 mag 0..7 -> e4m3 bytes {0,.5,1,1.5 | 2,3,4,6}
 __device__ __forceinline__ void decode8_e2m1(uint32_t uq, float d[8]){
-// Decode path is chosen per arch from measurement (see README): the hardware cvt.f16x2.e2m1x2 is
-// ~1-2% faster on sm_100/sm_103 (full-rate conversion pipe) but 13-37% SLOWER than the PRMT
-// register-LUT on sm_120 (consumer die, low-throughput e2m1 cvt pipe). So: hardware on sm_100/103,
-// PRMT on sm_120 and everything else.
+// Both hardware cvt.rn.f16x2.e2m1x2 and PRMT register-LUT work on sm_100 and
+// sm_120. This compile-time choice is for measured end-to-end performance, not ISA
+// support: on B200 (sm_100), hardware cvt vs PRMT was nearly tied (3862 -> 3846 us
+// one-shot; 2671 -> 2672 us two-shot). On RTX 6000D (sm_120), hardware cvt was
+// 37% slower one-shot and 13% slower two-shot than PRMT (README §4.7). Thus sm_100/
+// sm_103 use cvt and sm_120 uses PRMT by default; switch this #if and rebuild to
+// test the other path on either architecture. There is no runtime dispatch.
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__>=1000) && (__CUDA_ARCH__<1200)
     // TRUE hardware e2m1 decode (all Blackwell, needs explicit -gencode ...a):
     // cvt.rn.f16x2.e2m1x2 natively converts one byte (2 e2m1 nibbles) -> f16x2; low nibble ->
@@ -757,100 +760,118 @@ __global__ void trt_fp8_twoshot(__nv_fp8_e4m3** comm, uint64_t** barrier_in, __n
 static float host_global_scale(const float* h, size_t n){ float a=0; for(size_t i=0;i<n;i++) a=fmaxf(a,fabsf(h[i])); if(a==0) return 1.f; return (E2M1_MAX*448.f)/a; }
 static float host_global_scale_fp8(const float* h, size_t n){ float a=0; for(size_t i=0;i<n;i++) a=fmaxf(a,fabsf(h[i])); if(a==0) return 1.f; return (FP8_QMAX*448.f)/a; }
 
+
+// ============================ multi-process main (fabric handles) ============================
+#include <cuda.h>
+#include <fstream>
+#include <thread>
+#include <chrono>
+#include <sys/stat.h>
+#include <string>
+#define CU_CHECK(x) do{ CUresult _r=(x); if(_r!=CUDA_SUCCESS){ const char* _s=nullptr; cuGetErrorString(_r,&_s); \
+    fprintf(stderr,"CU %s:%d %s -> %s\n",__FILE__,__LINE__,#x,_s?_s:"?"); exit(1);} }while(0)
+
+static int LOCAL=0, NPROC=1, PROC=0, WORLD=0;
+struct ShBuf { CUdeviceptr va=0; size_t size=0; CUmemGenericAllocationHandle h=0; CUmemFabricHandle fh{}; };
+static void set_access_local(CUdeviceptr va, size_t size){
+    std::vector<CUmemAccessDesc> acc(LOCAL);
+    for(int d=0;d<LOCAL;d++){ acc[d].location.type=CU_MEM_LOCATION_TYPE_DEVICE; acc[d].location.id=d; acc[d].flags=CU_MEM_ACCESS_FLAGS_PROT_READWRITE; }
+    CU_CHECK(cuMemSetAccess(va,size,acc.data(),LOCAL));
+}
+static ShBuf alloc_shared(int local_dev, size_t bytes){
+    CUmemAllocationProp p={}; p.type=CU_MEM_ALLOCATION_TYPE_PINNED; p.location.type=CU_MEM_LOCATION_TYPE_DEVICE;
+    p.location.id=local_dev; p.requestedHandleTypes=CU_MEM_HANDLE_TYPE_FABRIC;
+    size_t gran=0; CU_CHECK(cuMemGetAllocationGranularity(&gran,&p,CU_MEM_ALLOC_GRANULARITY_MINIMUM));
+    ShBuf b; b.size=((bytes+gran-1)/gran)*gran; if(!b.size) b.size=gran;
+    CU_CHECK(cuMemCreate(&b.h,b.size,&p,0));
+    CU_CHECK(cuMemAddressReserve(&b.va,b.size,0,0,0));
+    CU_CHECK(cuMemMap(b.va,b.size,0,b.h,0));
+    set_access_local(b.va,b.size);
+    CU_CHECK(cuMemExportToShareableHandle(&b.fh,b.h,CU_MEM_HANDLE_TYPE_FABRIC,0));
+    return b;
+}
+static CUdeviceptr map_remote(const CUmemFabricHandle& fh, size_t size){
+    CUmemGenericAllocationHandle h; CUmemFabricHandle tmp=fh;
+    CU_CHECK(cuMemImportFromShareableHandle(&h,(void*)&tmp,CU_MEM_HANDLE_TYPE_FABRIC));
+    CUdeviceptr va; CU_CHECK(cuMemAddressReserve(&va,size,0,0,0)); CU_CHECK(cuMemMap(va,size,0,h,0));
+    set_access_local(va,size); return va;
+}
+static void fs_barrier(const std::string& dir, const std::string& name){
+    { std::ofstream f(dir+"/"+name+"."+std::to_string(PROC)); f<<"1"; }
+    for(;;){ int n=0; for(int p=0;p<NPROC;p++){ struct stat st; if(stat((dir+"/"+name+"."+std::to_string(p)).c_str(),&st)==0) n++; }
+        if(n==NPROC) return; std::this_thread::sleep_for(std::chrono::milliseconds(200)); }
+}
+enum { B_PL=0,B_RED,B_F8,B_F8RED,B_C1,B_C2,B_BA,B_BB,B_CTR,B_LPC,B_LPB,B_NVC,B_NVBA,B_NVBB,B_NV1C,B_NV1B,NB };
+struct RankHandles { CUmemFabricHandle fh[NB]; size_t sz[NB]; };
+
 int main(int argc,char**argv){
-    int world=8; size_t numel=(argc>1)?strtoull(argv[1],0,10):(1u<<20);
-    int ndev=0; CUDA_CHECK(cudaGetDeviceCount(&ndev)); if(ndev<world) world=ndev;
-    if(world!=NRANKS){ printf("need %d GPUs (RANKS templated=%d), have %d\n",NRANKS,NRANKS,world); return 1; }
-    if(numel%(size_t(world)*EPT32)!=0){ printf("numel must be %d-aligned\n",world*EPT32); return 1; }
-    const size_t shard=numel/world;
+    size_t numel=(argc>1)?strtoull(argv[1],0,10):(1u<<20);
+    const char* e; NPROC=(e=getenv("SLURM_NTASKS"))?atoi(e):1; PROC=(e=getenv("SLURM_PROCID"))?atoi(e):0;
+    CUDA_CHECK(cudaGetDeviceCount(&LOCAL)); WORLD=NPROC*LOCAL;
+    if(WORLD!=NRANKS){ printf("[p%d] WORLD=%d (NPROC %d x LOCAL %d) != NRANKS=%d\n",PROC,WORLD,NPROC,LOCAL,NRANKS); return 1; }
+    if(numel%(size_t(WORLD)*EPT32)!=0){ printf("numel must be %d-aligned\n",WORLD*EPT32); return 1; }
+    const int world=WORLD; const size_t shard=numel/world;
+    std::string jid=(e=getenv("SLURM_JOB_ID"))?e:"local"; std::string tag=(e=getenv("HS_TAG"))?e:"";   // HS_TAG: unique per invocation when the same numel runs twice in one job
+    std::string dir="/work/hs_"+jid+"_"+std::to_string(numel)+(tag.empty()?"":"_"+tag); mkdir(dir.c_str(),0777);
+    CU_CHECK(cuInit(0));
+    for(int d=0;d<LOCAL;d++){ CUDA_CHECK(cudaSetDevice(d)); CUDA_CHECK(cudaFree(0));
+        for(int j=0;j<LOCAL;j++) if(j!=d){ int can=0; cudaDeviceCanAccessPeer(&can,d,j); if(can){ cudaError_t r=cudaDeviceEnablePeerAccess(j,0); if(r!=cudaSuccess&&r!=cudaErrorPeerAccessAlreadyEnabled) CUDA_CHECK(r);} } }
+    CUDA_CHECK(cudaSetDevice(0));
 
-    for(int i=0;i<world;i++){ CUDA_CHECK(cudaSetDevice(i));
-        for(int j=0;j<world;j++) if(i!=j){ int can=0; cudaDeviceCanAccessPeer(&can,i,j);
-            if(can){ cudaError_t e=cudaDeviceEnablePeerAccess(j,0); if(e!=cudaSuccess&&e!=cudaErrorPeerAccessAlreadyEnabled) CUDA_CHECK(e);} } }
-
-    Nvfp4Layout L=Nvfp4Layout::make(numel);
+    Nvfp4Layout L=Nvfp4Layout::make(numel); Fp8Layout FL=Fp8Layout::make(numel);
+    // host data for ALL ranks (same seed on every process) -> identical reference everywhere
     std::vector<std::vector<float>> hin(world,std::vector<float>(numel)); std::vector<float> ref(numel,0);
-    srand(1234);
-    for(int r=0;r<world;r++) for(size_t i=0;i<numel;i++){ float v=(rand()/float(RAND_MAX))*2-1; hin[r][i]=v; ref[i]+=v; }
+    srand(1234); for(int r=0;r<world;r++) for(size_t i=0;i<numel;i++){ float v=(rand()/float(RAND_MAX))*2-1; hin[r][i]=v; ref[i]+=v; }
     float SF=host_global_scale(hin[0].data(),numel), SFr=SF/float(world);
-
-    // per-rank buffers
-    std::vector<__nv_bfloat16*> d_in(world),d_out(world);
-    std::vector<uint8_t*> d_pl(world),d_red(world);
-    Fp8Layout FL=Fp8Layout::make(numel);
-    std::vector<uint8_t*> d_f8(world),d_f8red(world);               // FP8 payload / reduced
-    // TRT-LLM FP8 two-shot buffers: per-rank comm buffer [RANKS][buffer_elts_per_rank] fp8 + barrier words
-    const size_t lp_elts_per_rank = numel/world;
-    const size_t lp_rounds = (lp_elts_per_rank + LP_ELTS_PER_BLOCK - 1)/LP_ELTS_PER_BLOCK;
-    const size_t lp_buf_elts_per_rank = (size_t)LP_ELTS_PER_BLOCK_WS*lp_rounds;
-    // TRT-LLM dispatch hard-codes grid = LP_MAX_BLOCKS*2 = 16 blocks (tuned for PCIe ~50 GB/s).
-    // On NVLink 16 blocks cannot saturate the link (measured: slower than BF16 on GB300), so we
-    // scale the grid to cover the shard (one block per 7936-elt round), clamped, unless the
-    // env var TRT_FP8_GRID pins it (e.g. TRT_FP8_GRID=16 reproduces TRT-LLM's verbatim dispatch).
-    int lp_grid = (int)std::min<size_t>(std::max<size_t>(lp_rounds, (size_t)LP_MAX_BLOCKS*2), 2048);
-    if (const char* g = getenv("TRT_FP8_GRID")) lp_grid = atoi(g);
-    const size_t lp_barrier_words = (size_t)(1+lp_grid)*world + 8;
-    std::vector<__nv_fp8_e4m3*> d_lpc(world); std::vector<uint64_t*> d_lpb(world);
-    std::vector<__nv_bfloat16*> d_comm1(world),d_comm2(world);      // TRT one/two-shot comm buffers
-    std::vector<uint32_t*> d_bar_a(world),d_bar_b(world);           // TRT fused-barrier signals (in/out)
-    std::vector<uint64_t*> d_ctr(world);                           // NVFP4 counter barrier
-    // NVFP4 fused (TRT structure): comm buffer [2*world][slot_bytes] + its own barrier arrays (up to NV_MAX_BLOCKS blocks)
-    const size_t nv_slot_bytes=((shard/2+shard/SF_VEC_SIZE)+15)&~size_t(15);
-    const size_t nv_barwords=2*(NV_MAX_BLOCKS+1)*world+8;
-    std::vector<uint8_t*> d_nvc(world); std::vector<uint32_t*> d_nvba(world),d_nvbb(world);
+    float SF8=host_global_scale_fp8(hin[0].data(),numel), SFr8=SF8/float(world);
+    const size_t lp_elts_per_rank=numel/world, lp_rounds=(lp_elts_per_rank+LP_ELTS_PER_BLOCK-1)/LP_ELTS_PER_BLOCK;
+    const size_t lp_buf_elts_per_rank=(size_t)LP_ELTS_PER_BLOCK_WS*lp_rounds;
+    int lp_grid=(int)std::min<size_t>(std::max<size_t>(lp_rounds,(size_t)LP_MAX_BLOCKS*2),2048); if(const char* g=getenv("TRT_FP8_GRID")) lp_grid=atoi(g);
+    const size_t lp_barrier_words=(size_t)(1+lp_grid)*world+8, barwords=2*(MAX_BLOCKS+1)*world+8;
+    const size_t nv_slot_bytes=((shard/2+shard/SF_VEC_SIZE)+15)&~size_t(15), nv_barwords=2*(NV_MAX_BLOCKS+1)*world+8;
     const size_t nv1_slot_bytes=((numel/2+numel/SF_VEC_SIZE)+15)&~size_t(15);
-    std::vector<uint8_t*> d_nv1c(world); std::vector<uint32_t*> d_nv1b(world);
-    const size_t barwords=2*(MAX_BLOCKS+1)*world + 8;
-    for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r));
-        CUDA_CHECK(cudaMalloc(&d_in[r],numel*2)); CUDA_CHECK(cudaMalloc(&d_out[r],numel*2));
-        CUDA_CHECK(cudaMalloc(&d_pl[r],L.total_bytes)); CUDA_CHECK(cudaMalloc(&d_red[r],L.total_bytes)); CUDA_CHECK(cudaMemset(d_red[r],0,L.total_bytes));
-        CUDA_CHECK(cudaMalloc(&d_f8[r],FL.total_bytes)); CUDA_CHECK(cudaMalloc(&d_f8red[r],FL.total_bytes)); CUDA_CHECK(cudaMemset(d_f8red[r],0,FL.total_bytes));
-        CUDA_CHECK(cudaMalloc(&d_lpc[r],(size_t)world*lp_buf_elts_per_rank)); CUDA_CHECK(cudaMemset(d_lpc[r],0,(size_t)world*lp_buf_elts_per_rank));
-        CUDA_CHECK(cudaMalloc(&d_lpb[r],lp_barrier_words*8)); CUDA_CHECK(cudaMemset(d_lpb[r],0,lp_barrier_words*8));
-        CUDA_CHECK(cudaMalloc(&d_comm1[r],(size_t)2*world*numel*2)); // [2*world][elts_total]
-        CUDA_CHECK(cudaMalloc(&d_comm2[r],(size_t)2*world*shard*2)); // [2*world][elts_per_rank]
-        CUDA_CHECK(cudaMalloc(&d_bar_a[r],barwords*4)); CUDA_CHECK(cudaMemset(d_bar_a[r],0,barwords*4));
-        CUDA_CHECK(cudaMalloc(&d_bar_b[r],barwords*4)); CUDA_CHECK(cudaMemset(d_bar_b[r],0,barwords*4));
-        CUDA_CHECK(cudaMalloc(&d_ctr[r],MAX_RANKS*8)); CUDA_CHECK(cudaMemset(d_ctr[r],0,MAX_RANKS*8));
-        CUDA_CHECK(cudaMalloc(&d_nvc[r],(size_t)2*world*nv_slot_bytes)); CUDA_CHECK(cudaMemset(d_nvc[r],0,(size_t)2*world*nv_slot_bytes));
-        CUDA_CHECK(cudaMalloc(&d_nvba[r],nv_barwords*4)); CUDA_CHECK(cudaMemset(d_nvba[r],0,nv_barwords*4));
-        CUDA_CHECK(cudaMalloc(&d_nvbb[r],nv_barwords*4)); CUDA_CHECK(cudaMemset(d_nvbb[r],0,nv_barwords*4));
-        CUDA_CHECK(cudaMalloc(&d_nv1c[r],(size_t)2*world*nv1_slot_bytes)); CUDA_CHECK(cudaMemset(d_nv1c[r],0,(size_t)2*world*nv1_slot_bytes));
-        CUDA_CHECK(cudaMalloc(&d_nv1b[r],nv_barwords*4)); CUDA_CHECK(cudaMemset(d_nv1b[r],0,nv_barwords*4));
-        std::vector<__nv_bfloat16> tmp(numel); for(size_t i=0;i<numel;i++) tmp[i]=__float2bfloat16(hin[r][i]);
-        CUDA_CHECK(cudaMemcpy(d_in[r],tmp.data(),numel*2,cudaMemcpyHostToDevice));
-    }
-    // peer pointer arrays (device)
-    std::vector<uint8_t**> pp_pl(world),pp_red(world),pp_f8(world),pp_f8red(world);
-    std::vector<__nv_fp8_e4m3**> pp_lpc(world); std::vector<uint64_t**> pp_lpb(world);
-    std::vector<__nv_bfloat16**> pp_c1(world),pp_c2(world);
-    std::vector<uint32_t**> pp_ba(world),pp_bb(world);
-    std::vector<uint64_t**> pp_ctr(world);
-    std::vector<uint8_t**> pp_nvc(world),pp_nv1c(world); std::vector<uint32_t**> pp_nvba(world),pp_nvbb(world),pp_nv1b(world);
-    for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r));
-        CUDA_CHECK(cudaMalloc(&pp_pl[r],world*8));  CUDA_CHECK(cudaMemcpy(pp_pl[r],d_pl.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_red[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_red[r],d_red.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_f8[r],world*8));  CUDA_CHECK(cudaMemcpy(pp_f8[r],d_f8.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_f8red[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_f8red[r],d_f8red.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_lpc[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_lpc[r],d_lpc.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_lpb[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_lpb[r],d_lpb.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_c1[r],world*8));  CUDA_CHECK(cudaMemcpy(pp_c1[r],d_comm1.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_c2[r],world*8));  CUDA_CHECK(cudaMemcpy(pp_c2[r],d_comm2.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_ba[r],world*8));  CUDA_CHECK(cudaMemcpy(pp_ba[r],d_bar_a.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_bb[r],world*8));  CUDA_CHECK(cudaMemcpy(pp_bb[r],d_bar_b.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_ctr[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_ctr[r],d_ctr.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_nvc[r],world*8));  CUDA_CHECK(cudaMemcpy(pp_nvc[r],d_nvc.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_nvba[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_nvba[r],d_nvba.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_nvbb[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_nvbb[r],d_nvbb.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_nv1c[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_nv1c[r],d_nv1c.data(),world*8,cudaMemcpyHostToDevice));
-        CUDA_CHECK(cudaMalloc(&pp_nv1b[r],world*8)); CUDA_CHECK(cudaMemcpy(pp_nv1b[r],d_nv1b.data(),world*8,cudaMemcpyHostToDevice));
-    }
 
-    const int TPB=256; const int PACKED=8;
-    size_t nthr=numel/ELTS_PER_THREAD; int grid=int((nthr+TPB-1)/TPB);
-    size_t sthr=shard/ELTS_PER_THREAD; int grid_s=int((sthr+TPB-1)/TPB);
+    // ---- per LOCAL rank: private in/out + shared buffers (fabric) ----
+    std::vector<__nv_bfloat16*> d_in(LOCAL),d_out(LOCAL);
+    std::vector<std::vector<ShBuf>> sh(LOCAL,std::vector<ShBuf>(NB));
+    size_t need[NB]={L.total_bytes,L.total_bytes,FL.total_bytes,FL.total_bytes,(size_t)2*world*numel*2,(size_t)2*world*shard*2,barwords*4,barwords*4,MAX_RANKS*8,(size_t)world*lp_buf_elts_per_rank,lp_barrier_words*8,(size_t)2*world*nv_slot_bytes,nv_barwords*4,nv_barwords*4,(size_t)2*world*nv1_slot_bytes,nv_barwords*4};
+    for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; CUDA_CHECK(cudaSetDevice(lr));
+        CUDA_CHECK(cudaMalloc(&d_in[lr],numel*2)); CUDA_CHECK(cudaMalloc(&d_out[lr],numel*2));
+        std::vector<__nv_bfloat16> tmp(numel); for(size_t i=0;i<numel;i++) tmp[i]=__float2bfloat16(hin[r][i]);
+        CUDA_CHECK(cudaMemcpy(d_in[lr],tmp.data(),numel*2,cudaMemcpyHostToDevice));
+        for(int b=0;b<NB;b++){ sh[lr][b]=alloc_shared(lr,need[b]); CUDA_CHECK(cudaMemset((void*)sh[lr][b].va,0,sh[lr][b].size)); }
+        CUDA_CHECK(cudaDeviceSynchronize());
+    }
+    // ---- exchange fabric handles through the shared filesystem ----
+    for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; RankHandles rh{}; for(int b=0;b<NB;b++){ rh.fh[b]=sh[lr][b].fh; rh.sz[b]=sh[lr][b].size; }
+        std::string tmpn=dir+"/rank"+std::to_string(r)+".tmp", fin=dir+"/rank"+std::to_string(r)+".bin";
+        { std::ofstream f(tmpn,std::ios::binary); f.write((char*)&rh,sizeof rh); } rename(tmpn.c_str(),fin.c_str()); }
+    std::vector<RankHandles> all(world);
+    for(int r=0;r<world;r++){ std::string fin=dir+"/rank"+std::to_string(r)+".bin";
+        for(;;){ std::ifstream f(fin,std::ios::binary); if(f && f.read((char*)&all[r],sizeof(RankHandles))) break; std::this_thread::sleep_for(std::chrono::milliseconds(200)); } }
+    // ---- resolve every rank's buffers to a VA usable from this process ----
+    std::vector<std::vector<CUdeviceptr>> va(world,std::vector<CUdeviceptr>(NB));
+    for(int r=0;r<world;r++) for(int b=0;b<NB;b++){
+        if(r/LOCAL==PROC) va[r][b]=sh[r%LOCAL][b].va; else va[r][b]=map_remote(all[r].fh[b],all[r].sz[b]); }
+    fs_barrier(dir,"mapped");   // everyone has zeroed its buffers and mapped everyone else's before any kernel runs
+    if(PROC==0) printf("world=%d (%d procs x %d gpus)  numel=%zu  NVFP4 payload/rank=%zu B (BF16 %zu B, %.2fx)\n",world,NPROC,LOCAL,numel,L.total_bytes,numel*2,double(numel*2)/L.total_bytes);
+
+    // ---- per-local-rank device arrays of world pointers ----
+    auto mk_pp=[&](int lr,int b)->void*{ std::vector<void*> h(world); for(int r=0;r<world;r++) h[r]=(void*)va[r][b];
+        void** d; CUDA_CHECK(cudaSetDevice(lr)); CUDA_CHECK(cudaMalloc(&d,world*sizeof(void*))); CUDA_CHECK(cudaMemcpy(d,h.data(),world*sizeof(void*),cudaMemcpyHostToDevice)); return (void*)d; };
+    std::vector<uint8_t**> pp_pl(LOCAL),pp_red(LOCAL),pp_f8(LOCAL),pp_f8red(LOCAL);
+    std::vector<__nv_bfloat16**> pp_c1(LOCAL),pp_c2(LOCAL); std::vector<uint32_t**> pp_ba(LOCAL),pp_bb(LOCAL);
+    std::vector<uint64_t**> pp_ctr(LOCAL),pp_lpb(LOCAL); std::vector<__nv_fp8_e4m3**> pp_lpc(LOCAL);
+    for(int lr=0;lr<LOCAL;lr++){ pp_pl[lr]=(uint8_t**)mk_pp(lr,B_PL); pp_red[lr]=(uint8_t**)mk_pp(lr,B_RED); pp_f8[lr]=(uint8_t**)mk_pp(lr,B_F8); pp_f8red[lr]=(uint8_t**)mk_pp(lr,B_F8RED);
+        pp_c1[lr]=(__nv_bfloat16**)mk_pp(lr,B_C1); pp_c2[lr]=(__nv_bfloat16**)mk_pp(lr,B_C2); pp_ba[lr]=(uint32_t**)mk_pp(lr,B_BA); pp_bb[lr]=(uint32_t**)mk_pp(lr,B_BB);
+        pp_ctr[lr]=(uint64_t**)mk_pp(lr,B_CTR); pp_lpc[lr]=(__nv_fp8_e4m3**)mk_pp(lr,B_LPC); pp_lpb[lr]=(uint64_t**)mk_pp(lr,B_LPB); }
+    std::vector<uint8_t**> pp_nvc(LOCAL),pp_nv1c(LOCAL); std::vector<uint32_t**> pp_nvba(LOCAL),pp_nvbb(LOCAL),pp_nv1b(LOCAL);
+    for(int lr=0;lr<LOCAL;lr++){ pp_nvc[lr]=(uint8_t**)mk_pp(lr,B_NVC); pp_nvba[lr]=(uint32_t**)mk_pp(lr,B_NVBA); pp_nvbb[lr]=(uint32_t**)mk_pp(lr,B_NVBB);
+        pp_nv1c[lr]=(uint8_t**)mk_pp(lr,B_NV1C); pp_nv1b[lr]=(uint32_t**)mk_pp(lr,B_NV1B); }
+    auto own=[&](int lr,int b){ return (void*)sh[lr][b].va; };
+
+    const int TPB=256, PACKED=8; size_t nthr=numel/ELTS_PER_THREAD; int grid=int((nthr+TPB-1)/TPB); size_t sthr=shard/ELTS_PER_THREAD; int grid_s=int((sthr+TPB-1)/TPB);
     int grid_s32=int((shard/EPT32+TPB-1)/TPB), grid_ag32=int((numel/EPT32+TPB-1)/TPB);
-    // fused NVFP4: one block per (TPB*32)-elt chunk of the shard, capped at NV_MAX_BLOCKS (env NV_GRID overrides)
     size_t nv_chunks=(shard+(size_t)TPB*EPT32-1)/((size_t)TPB*EPT32);
     // NVLink rule from the B200 sweep: one chunk per block up to 256 blocks, then 4 chunks/thread up to 2048; floor 16.
     // PCIe wants 4-8 blocks: set NV_GRID=8 (or NV_PCIE=1).
@@ -859,185 +880,80 @@ int main(int argc,char**argv){
     int grid_os32=int((numel/EPT32+TPB-1)/TPB);
     size_t nv1_chunks=(numel+(size_t)TPB*EPT32-1)/((size_t)TPB*EPT32);
     int g_nv1=(int)std::min<size_t>(std::max<size_t>(std::max<size_t>(std::min<size_t>(nv1_chunks,256),nv1_chunks/4),(size_t)16),(size_t)NV_MAX_BLOCKS);
-    if(const char* e=getenv("NV_GRID1")) g_nv1=atoi(e); else if(getenv("NV_PCIE")) g_nv1=8;
+    if(const char* ge1=getenv("NV_GRID1")) g_nv1=atoi(ge1); else if(getenv("NV_PCIE")) g_nv1=8;
     size_t epb_nv1=((numel+(size_t)g_nv1*TPB*EPT32-1)/((size_t)g_nv1*TPB*EPT32))*((size_t)TPB*EPT32);
-    if(const char* e=getenv("NV_GRID")) g_nv=atoi(e);
+    if(const char* ge=getenv("NV_GRID")) g_nv=atoi(ge);
     size_t epb_nv=((shard+(size_t)g_nv*TPB*EPT32-1)/((size_t)g_nv*TPB*EPT32))*((size_t)TPB*EPT32);
-    // TRT grids: cap at MAX_BLOCKS, elts_per_block multiple of TPB*PACKED
-    auto trt_grid=[&](size_t elts){ size_t need=(elts+TPB*PACKED-1)/(TPB*PACKED); int g=(int)std::min<size_t>(need,MAX_BLOCKS); return g<1?1:g; };
-    int g1=trt_grid(numel);  size_t epb1=((numel+ (size_t)g1*TPB*PACKED-1)/((size_t)g1*TPB*PACKED))*(TPB*PACKED);
-    int g2=trt_grid(shard);  size_t epb2=((shard+ (size_t)g2*TPB*PACKED-1)/((size_t)g2*TPB*PACKED))*(TPB*PACKED);
+    auto trt_grid=[&](size_t elts){ size_t need2=(elts+TPB*PACKED-1)/(TPB*PACKED); int g=(int)std::min<size_t>(need2,MAX_BLOCKS); return g<1?1:g; };
+    int g1=trt_grid(numel); size_t epb1=((numel+(size_t)g1*TPB*PACKED-1)/((size_t)g1*TPB*PACKED))*(TPB*PACKED);
+    int g2=trt_grid(shard); size_t epb2=((shard+(size_t)g2*TPB*PACKED-1)/((size_t)g2*TPB*PACKED))*(TPB*PACKED);
+    auto sync_local=[&](){ for(int lr=0;lr<LOCAL;lr++){ CUDA_CHECK(cudaSetDevice(lr)); CUDA_CHECK(cudaDeviceSynchronize()); } };
+    const bool big=numel>=(size_t(1)<<27); const int WARMUP=big?5:20, ITERS=big?20:100;
+    auto rel_rmse=[&](std::vector<__nv_bfloat16>&h){ double s=0,sr=0; for(size_t i=0;i<numel;i++){ float o=__bfloat162float(h[i]); double d=o-ref[i]; s+=d*d; sr+=double(ref[i])*ref[i]; } return sqrt(s/(sr+1e-12)); };
+    auto check=[&](const char* name){ if(PROC!=0) return; std::vector<__nv_bfloat16> h(numel); CUDA_CHECK(cudaSetDevice(0));
+        CUDA_CHECK(cudaMemcpy(h.data(),d_out[0],numel*2,cudaMemcpyDeviceToHost)); printf("  %-18s rel_rmse=%.6f\n",name,rel_rmse(h)); };
 
-    auto sync_all=[&](){ for(int r=0;r<world;r++){ CUDA_CHECK(cudaSetDevice(r)); CUDA_CHECK(cudaDeviceSynchronize()); } };
-    // large messages (>=128M elts): O(N^2) one-shot on PCIe is ~10s/iter, so use fewer iters
-    const bool big = numel >= (size_t(1)<<27);
-    const int WARMUP = big ? 5 : 20, ITERS = big ? 20 : 100;
-    auto rel_rmse=[&](std::vector<__nv_bfloat16>&h){ double s=0,sr=0; for(size_t i=0;i<numel;i++){ float o=__bfloat162float(h[i]); double e=o-ref[i]; s+=e*e; sr+=double(ref[i])*ref[i]; } return sqrt(s/(sr+1e-12)); };
-
-    auto check=[&](const char*name){ std::vector<__nv_bfloat16> h(numel); CUDA_CHECK(cudaSetDevice(0));
-        CUDA_CHECK(cudaMemcpy(h.data(),d_out[0],numel*2,cudaMemcpyDeviceToHost));
-        printf("  %-18s rel_rmse=%.6f\n",name,rel_rmse(h)); };
-
-    printf("world=%d numel=%zu  NVFP4 payload/rank=%zu B (BF16 %zu B, %.2fx smaller)\n",
-           world,numel,L.total_bytes,numel*2,double(numel*2)/L.total_bytes);
-
-    // ---------- lambdas for one allreduce pass ----------
-    // single monotonic flag shared by all TRT calls that touch pp_ba (stale flags are
-    // always strictly lower, so block_barrier never false-passes on a repeated value).
-    uint32_t trtflag=1;
-    auto run_trt_oneshot=[&](){
-        for(int r=0;r<world;r++){ cudaSetDevice(r);
-            trt_oneshot_push<NRANKS><<<g1,TPB>>>(d_in[r],d_out[r],pp_c1[r],pp_ba[r],r,numel,epb1,trtflag); }
-        trtflag++;
-    };
-    auto run_trt_twoshot=[&](){
-        for(int r=0;r<world;r++){ cudaSetDevice(r);
-            trt_twoshot_push<NRANKS><<<g2,TPB>>>(d_in[r],d_out[r],pp_c2[r],pp_ba[r],pp_bb[r],r,numel,shard,epb2,trtflag); }
-        trtflag++;
-    };
-    uint64_t nvflag=1;
+    uint32_t trtflag=1, nvfflag=1, nv1flag=1; uint64_t nvflag=1, lpflag=1;
+    auto run_nvfp4_oneshot_fused=[&](){ for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr);
+        nvfp4_oneshot_fused<NRANKS><<<g_nv1,TPB>>>(d_in[lr],d_out[lr],pp_nv1c[lr],pp_nv1b[lr],r,numel,nv1_slot_bytes,epb_nv1,SF,nv1flag); } nv1flag++; };
+    auto run_nvfp4_fused=[&](){ for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr);
+        nvfp4_twoshot_fused<NRANKS><<<g_nv,TPB>>>(d_in[lr],d_out[lr],pp_nvc[lr],pp_nvba[lr],pp_nvbb[lr],r,shard,nv_slot_bytes,epb_nv,SF,SFr,nvfflag); } nvfflag++; }; const size_t lp_smem=(size_t)LP_WARPS*world*sizeof(float)*2;
+    auto run_trt_oneshot=[&](){ for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr);
+        trt_oneshot_push<NRANKS><<<g1,TPB>>>(d_in[lr],d_out[lr],pp_c1[lr],pp_ba[lr],r,numel,epb1,trtflag); } trtflag++; };
+    auto run_trt_twoshot=[&](){ for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr);
+        trt_twoshot_push<NRANKS><<<g2,TPB>>>(d_in[lr],d_out[lr],pp_c2[lr],pp_ba[lr],pp_bb[lr],r,numel,shard,epb2,trtflag); } trtflag++; };
     auto run_nvfp4_oneshot=[&](){
-        for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_quantize<<<grid,TPB>>>(d_in[r],d_pl[r],L,SF); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_oneshot<<<grid_os32,TPB>>>(pp_pl[r],d_out[r],L,world,r); }
-        nvflag++;
-    };
+        for(int lr=0;lr<LOCAL;lr++){ cudaSetDevice(lr); nvfp4_quantize<<<grid,TPB>>>(d_in[lr],(uint8_t*)own(lr,B_PL),L,SF); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[lr],r,world,nvflag); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); nvfp4_oneshot<<<grid_os32,TPB>>>(pp_pl[lr],d_out[lr],L,world,r); } nvflag++; };
     auto run_nvfp4_twoshot=[&](){
-        for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_quantize<<<grid,TPB>>>(d_in[r],d_pl[r],L,SF); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_reducescatter<<<grid_s32,TPB>>>(pp_pl[r],d_red[r],L,world,r,shard,SFr); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag+1); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_allgather<<<grid_ag32,TPB>>>(pp_red[r],d_out[r],L,world,shard,r); }
-        nvflag+=2;
-    };
-    uint32_t nv1flag=1;
-    auto run_nvfp4_oneshot_fused=[&](){
-        for(int r=0;r<world;r++){ cudaSetDevice(r);
-            nvfp4_oneshot_fused<NRANKS><<<g_nv1,TPB>>>(d_in[r],d_out[r],pp_nv1c[r],pp_nv1b[r],r,numel,nv1_slot_bytes,epb_nv1,SF,nv1flag); }
-        nv1flag++;
-    };
-    uint32_t nvfflag=1;
-    auto run_nvfp4_fused=[&](){
-        for(int r=0;r<world;r++){ cudaSetDevice(r);
-            nvfp4_twoshot_fused<NRANKS><<<g_nv,TPB>>>(d_in[r],d_out[r],pp_nvc[r],pp_nvba[r],pp_nvbb[r],r,shard,nv_slot_bytes,epb_nv,SF,SFr,nvfflag); }
-        nvfflag++;
-    };
-    float SF8=host_global_scale_fp8(hin[0].data(),numel), SFr8=SF8/float(world);
+        for(int lr=0;lr<LOCAL;lr++){ cudaSetDevice(lr); nvfp4_quantize<<<grid,TPB>>>(d_in[lr],(uint8_t*)own(lr,B_PL),L,SF); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[lr],r,world,nvflag); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); nvfp4_reducescatter<<<grid_s32,TPB>>>(pp_pl[lr],(uint8_t*)own(lr,B_RED),L,world,r,shard,SFr); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[lr],r,world,nvflag+1); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); nvfp4_allgather<<<grid_ag32,TPB>>>(pp_red[lr],d_out[lr],L,world,shard,r); } nvflag+=2; };
     auto run_fp8_oneshot=[&](){
-        for(int r=0;r<world;r++){ cudaSetDevice(r); fp8_quantize<<<grid,TPB>>>(d_in[r],d_f8[r],FL,SF8); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); fp8_oneshot<<<grid,TPB>>>(pp_f8[r],d_out[r],FL,world); }
-        nvflag++;
-    };
+        for(int lr=0;lr<LOCAL;lr++){ cudaSetDevice(lr); fp8_quantize<<<grid,TPB>>>(d_in[lr],(uint8_t*)own(lr,B_F8),FL,SF8); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[lr],r,world,nvflag); }
+        for(int lr=0;lr<LOCAL;lr++){ cudaSetDevice(lr); fp8_oneshot<<<grid,TPB>>>(pp_f8[lr],d_out[lr],FL,world); } nvflag++; };
     auto run_fp8_twoshot=[&](){
-        for(int r=0;r<world;r++){ cudaSetDevice(r); fp8_quantize<<<grid,TPB>>>(d_in[r],d_f8[r],FL,SF8); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); fp8_reducescatter<<<grid_s,TPB>>>(pp_f8[r],d_f8red[r],FL,world,r,shard,SFr8); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag+1); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r); fp8_allgather<<<grid,TPB>>>(pp_f8red[r],d_out[r],FL,world,shard,r); }
-        nvflag+=2;
-    };
-
-    // TRT-LLM FP8 two-shot: preprocess (quantize into own comm buffer) + fused driver, per rank
-    uint64_t lpflag=1;
-    const size_t lp_smem=(size_t)LP_WARPS*world*sizeof(float)*2;
+        for(int lr=0;lr<LOCAL;lr++){ cudaSetDevice(lr); fp8_quantize<<<grid,TPB>>>(d_in[lr],(uint8_t*)own(lr,B_F8),FL,SF8); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[lr],r,world,nvflag); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); fp8_reducescatter<<<grid_s,TPB>>>(pp_f8[lr],(uint8_t*)own(lr,B_F8RED),FL,world,r,shard,SFr8); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[lr],r,world,nvflag+1); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); fp8_allgather<<<grid,TPB>>>(pp_f8red[lr],d_out[lr],FL,world,shard,r); } nvflag+=2; };
     auto run_trt_fp8=[&](){
-        for(int r=0;r<world;r++){ cudaSetDevice(r);
-            trt_fp8_preprocess<NRANKS><<<(unsigned)(lp_rounds*world),LP_BLOCK>>>(d_in[r],lp_elts_per_rank,lp_buf_elts_per_rank,d_lpc[r]); }
-        for(int r=0;r<world;r++){ cudaSetDevice(r);
-            trt_fp8_twoshot<NRANKS><<<lp_grid,LP_BLOCK,lp_smem>>>(pp_lpc[r],pp_lpb[r],d_out[r],r,lp_elts_per_rank,lp_buf_elts_per_rank,lpflag); }
-        lpflag++;
-    };
+        for(int lr=0;lr<LOCAL;lr++){ cudaSetDevice(lr); trt_fp8_preprocess<NRANKS><<<(unsigned)(lp_rounds*world),LP_BLOCK>>>(d_in[lr],lp_elts_per_rank,lp_buf_elts_per_rank,(__nv_fp8_e4m3*)own(lr,B_LPC)); }
+        for(int lr=0;lr<LOCAL;lr++){ int r=PROC*LOCAL+lr; cudaSetDevice(lr); trt_fp8_twoshot<NRANKS><<<lp_grid,LP_BLOCK,lp_smem>>>(pp_lpc[lr],pp_lpb[lr],d_out[lr],r,lp_elts_per_rank,lp_buf_elts_per_rank,lpflag); } lpflag++; };
 
-    // ---------- correctness ----------
-    printf("correctness:\n");
-    run_trt_oneshot();  sync_all(); check("TRT-BF16-oneshot");
-    run_trt_twoshot();  sync_all(); check("TRT-BF16-twoshot");
-    run_fp8_oneshot();  sync_all(); check("FP8-oneshot");
-    run_fp8_twoshot();  sync_all(); check("FP8-twoshot");
-    run_trt_fp8();      sync_all(); check("TRT-FP8-twoshot");
-    run_nvfp4_oneshot(); sync_all(); check("NVFP4-oneshot");
-    run_nvfp4_twoshot(); sync_all(); check("NVFP4-twoshot");
-    run_nvfp4_fused();   sync_all(); check("NVFP4-fused");
-    run_nvfp4_oneshot_fused(); sync_all(); check("NVFP4-oneshot-fused");
+    if(PROC==0) printf("correctness (rank 0):\n");
+    run_trt_oneshot();  sync_local(); check("TRT-BF16-oneshot");
+    run_trt_twoshot();  sync_local(); check("TRT-BF16-twoshot");
+    run_fp8_oneshot();  sync_local(); check("FP8-oneshot");
+    run_fp8_twoshot();  sync_local(); check("FP8-twoshot");
+    run_trt_fp8();      sync_local(); check("TRT-FP8-twoshot");
+    run_nvfp4_oneshot(); sync_local(); check("NVFP4-oneshot");
+    run_nvfp4_twoshot(); sync_local(); check("NVFP4-twoshot");
+    run_nvfp4_fused();   sync_local(); check("NVFP4-fused");
+    run_nvfp4_oneshot_fused(); sync_local(); check("NVFP4-oneshot-fused");
 
-    // ---------- timing ----------
-    auto bench=[&](void(*)(),  const char*){}; (void)bench;
-    auto time_it=[&](auto fn)->double{
-        for(int it=0;it<WARMUP;it++) fn(); sync_all();
-        cudaSetDevice(0); cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b);
-        cudaEventRecord(a); for(int it=0;it<ITERS;it++) fn(); cudaSetDevice(0); cudaEventRecord(b); cudaEventSynchronize(b);
-        float ms=0; cudaEventElapsedTime(&ms,a,b); return ms*1e3/ITERS;
-    };
-    double t_trt1=time_it(run_trt_oneshot);
-    double t_f81 =time_it(run_fp8_oneshot);
-    double t_nv1 =time_it(run_nvfp4_oneshot);
-    double t_trt2=time_it(run_trt_twoshot);
-    double t_f82 =time_it(run_fp8_twoshot);
-    double t_trtf8=time_it(run_trt_fp8);
-    double t_nv2 =time_it(run_nvfp4_twoshot);
-    double t_nvf =time_it(run_nvfp4_fused);
-    double t_nv1f=time_it(run_nvfp4_oneshot_fused);
-
-    double bf16B=numel*2.0;
-    printf("PAYLOAD bytes/elt  BF16=2.000  FP8=%.4f (%.2fx)  NVFP4=%.4f (%.2fx)\n",
-           double(FL.total_bytes)/numel, bf16B/FL.total_bytes,
-           double(L.total_bytes)/numel,  bf16B/L.total_bytes);
-    printf("TIMING (us/allreduce):\n");
-    printf("  ONE-SHOT  BF16=%.2f  FP8=%.2f  NVFP4=%.2f  | NVFP4/BF16=%.2fx  NVFP4/FP8=%.2fx\n",
-           t_trt1,t_f81,t_nv1, t_trt1/t_nv1, t_f81/t_nv1);
-    printf("  ONE-SHOT-FUSED NVFP4=%.2f (grid=%d)  | fused1/BF16=%.2fx  fused1 vs 3-launch=%.2fx\n", t_nv1f, g_nv1, t_trt1/t_nv1f, t_nv1/t_nv1f);
-    printf("  (TRT-FP8 grid=%d blocks x %d thr)\n", lp_grid, LP_BLOCK);
-    printf("  TWO-SHOT  BF16=%.2f  myFP8=%.2f  TRT-FP8=%.2f  NVFP4=%.2f  | NVFP4/BF16=%.2fx  NVFP4/myFP8=%.2fx  NVFP4/TRT-FP8=%.2fx  myFP8/TRT-FP8=%.2fx\n",
-           t_trt2,t_f82,t_trtf8,t_nv2, t_trt2/t_nv2, t_f82/t_nv2, t_trtf8/t_nv2, t_f82/t_trtf8);
-    printf("  FUSED     NVFP4-fused=%.2f (grid=%d x %d thr)  | fused/BF16=%.2fx  fused/TRT-FP8=%.2fx  fused vs 5-launch=%.2fx\n",
-           t_nvf, g_nv, TPB, t_trt2/t_nvf, t_trtf8/t_nvf, t_nv2/t_nvf);
-    if(getenv("PHASE")){
-        // per-phase timing on rank 0's stream: events bracket each launch group; barrier phases
-        // therefore include the wait for the slowest peer.
-        auto phase_time=[&](std::vector<std::function<void()>> ph, const char* name, std::vector<const char*> pn, std::vector<double> bytes){
-            int P=(int)ph.size(); std::vector<cudaEvent_t> ea(P),eb(P); cudaSetDevice(0);
-            for(int p=0;p<P;p++){ cudaEventCreate(&ea[p]); cudaEventCreate(&eb[p]); }
-            std::vector<double> acc(P,0);
-            for(int it=0;it<WARMUP;it++){ for(auto&f:ph) f(); } sync_all();
-            for(int it=0;it<ITERS;it++){
-                for(int p=0;p<P;p++){ cudaSetDevice(0); cudaEventRecord(ea[p]); ph[p](); cudaSetDevice(0); cudaEventRecord(eb[p]); }
-                cudaSetDevice(0); cudaEventSynchronize(eb[P-1]);
-                for(int p=0;p<P;p++){ float ms=0; cudaEventElapsedTime(&ms,ea[p],eb[p]); acc[p]+=ms*1e3; }
-            }
-            sync_all();
-            printf("PHASES %-9s (rank0, us / GB/s):", name); double tot=0;
-            for(int p=0;p<P;p++){ double us=acc[p]/ITERS; tot+=us;
-                if(bytes[p]>0) printf("  %s=%.1f(%.0f)", pn[p], us, bytes[p]/us*1e-3); else printf("  %s=%.1f", pn[p], us); }
-            printf("  | sum=%.1f\n", tot);
-        };
-        const double W=world, shp=double(L.total_bytes)/W, shp8=double(FL.total_bytes)/W;
-        phase_time({
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_quantize<<<grid,TPB>>>(d_in[r],d_pl[r],L,SF); } },
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag); } },
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_reducescatter<<<grid_s32,TPB>>>(pp_pl[r],d_red[r],L,world,r,shard,SFr); } },
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag+1); } },
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); nvfp4_allgather<<<grid_ag32,TPB>>>(pp_red[r],d_out[r],L,world,shard,r); } nvflag+=2; } },
-            "NVFP4", {"quant","bar1","RS","bar2","AG"},
-            { numel*2.0+L.total_bytes, 0, W*shp+shp, 0, double(L.total_bytes)+numel*2.0 });
-        phase_time({
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); fp8_quantize<<<grid,TPB>>>(d_in[r],d_f8[r],FL,SF8); } },
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag); } },
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); fp8_reducescatter<<<grid_s,TPB>>>(pp_f8[r],d_f8red[r],FL,world,r,shard,SFr8); } },
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); ctr_barrier<<<1,MAX_RANKS>>>(pp_ctr[r],r,world,nvflag+1); } },
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); fp8_allgather<<<grid,TPB>>>(pp_f8red[r],d_out[r],FL,world,shard,r); } nvflag+=2; } },
-            "myFP8", {"quant","bar1","RS","bar2","AG"},
-            { numel*2.0+FL.total_bytes, 0, W*shp8+shp8, 0, double(FL.total_bytes)+numel*2.0 });
-        const double lpb=double(lp_buf_elts_per_rank);
-        phase_time({
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); trt_fp8_preprocess<NRANKS><<<(unsigned)(lp_rounds*world),LP_BLOCK>>>(d_in[r],lp_elts_per_rank,lp_buf_elts_per_rank,d_lpc[r]); } },
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); trt_fp8_twoshot<NRANKS><<<lp_grid,LP_BLOCK,lp_smem>>>(pp_lpc[r],pp_lpb[r],d_out[r],r,lp_elts_per_rank,lp_buf_elts_per_rank,lpflag); } lpflag++; } },
-            "TRT-FP8", {"prep","fused(RS+AG)"},
-            { numel*2.0+W*lpb, W*lpb+lpb+W*lpb+numel*2.0 });
-        phase_time({ [&](){ run_nvfp4_fused(); } }, "NVFP4-fus", {"fused"}, { numel*2.0+W*shp+W*shp+shp+W*shp+numel*2.0 });
-        phase_time({
-            [&](){ for(int r=0;r<world;r++){ cudaSetDevice(r); trt_twoshot_push<NRANKS><<<g2,TPB>>>(d_in[r],d_out[r],pp_c2[r],pp_ba[r],pp_bb[r],r,numel,shard,epb2,trtflag); } trtflag++; } },
-            "TRT-BF16", {"fused"}, { numel*2.0*3 });
+    auto time_it=[&](auto fn)->double{ for(int it=0;it<WARMUP;it++) fn(); sync_local();
+        cudaSetDevice(0); cudaEvent_t a,b; cudaEventCreate(&a); cudaEventCreate(&b); cudaEventRecord(a);
+        for(int it=0;it<ITERS;it++) fn(); cudaSetDevice(0); cudaEventRecord(b); cudaEventSynchronize(b);
+        float ms=0; cudaEventElapsedTime(&ms,a,b); return ms*1e3/ITERS; };
+    double t_trt1=time_it(run_trt_oneshot), t_f81=time_it(run_fp8_oneshot), t_nv1=time_it(run_nvfp4_oneshot);
+    double t_trt2=time_it(run_trt_twoshot), t_f82=time_it(run_fp8_twoshot), t_trtf8=time_it(run_trt_fp8), t_nv2=time_it(run_nvfp4_twoshot), t_nvf=time_it(run_nvfp4_fused), t_nv1f=time_it(run_nvfp4_oneshot_fused);
+    sync_local(); fs_barrier(dir,"done");
+    if(PROC==0){
+        printf("PAYLOAD bytes/elt  BF16=2.000  FP8=%.4f (%.2fx)  NVFP4=%.4f (%.2fx)\n",double(FL.total_bytes)/numel,numel*2.0/FL.total_bytes,double(L.total_bytes)/numel,numel*2.0/L.total_bytes);
+        printf("TIMING (us/allreduce, %d ranks over %d nodes):\n",world,NPROC);
+        printf("  ONE-SHOT  BF16=%.2f  FP8=%.2f  NVFP4=%.2f  | NVFP4/BF16=%.2fx  NVFP4/FP8=%.2fx\n",t_trt1,t_f81,t_nv1,t_trt1/t_nv1,t_f81/t_nv1);
+        printf("  ONE-SHOT-FUSED NVFP4=%.2f (grid=%d)  | fused1/BF16=%.2fx  fused1 vs 3-launch=%.2fx\n",t_nv1f,g_nv1,t_trt1/t_nv1f,t_nv1/t_nv1f);
+        printf("  (TRT-FP8 grid=%d blocks x %d thr)\n",lp_grid,LP_BLOCK);
+        printf("  TWO-SHOT  BF16=%.2f  myFP8=%.2f  TRT-FP8=%.2f  NVFP4=%.2f  | NVFP4/BF16=%.2fx  NVFP4/myFP8=%.2fx  NVFP4/TRT-FP8=%.2fx  myFP8/TRT-FP8=%.2fx\n",t_trt2,t_f82,t_trtf8,t_nv2,t_trt2/t_nv2,t_f82/t_nv2,t_trtf8/t_nv2,t_f82/t_trtf8);
+        printf("  FUSED     NVFP4-fused=%.2f (grid=%d x %d thr)  | fused/BF16=%.2fx  fused/TRT-FP8=%.2fx  fused vs 5-launch=%.2fx\n",t_nvf,g_nv,TPB,t_trt2/t_nvf,t_trtf8/t_nvf,t_nv2/t_nvf);
+    } else {
+        printf("[p%d] TIMING  one: BF16=%.2f FP8=%.2f NVFP4=%.2f | two: BF16=%.2f myFP8=%.2f TRT-FP8=%.2f NVFP4=%.2f fused=%.2f fused1=%.2f\n",PROC,t_trt1,t_f81,t_nv1,t_trt2,t_f82,t_trtf8,t_nv2,t_nvf,t_nv1f);
     }
     return 0;
 }

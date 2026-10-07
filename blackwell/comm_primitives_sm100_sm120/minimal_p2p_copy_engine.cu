@@ -18,7 +18,7 @@
  * of loads in flight per SM is small, so pull is bandwidth = in-flight bytes / latency.
  * The grid argument lets you see both effects; on a switch-less PCIe host too MANY
  * writers also hurt (root-complex contention), so push peaks at a small grid.
- * ../allreduce/README.md §4.6 has the measured table for an 8-GPU RTX 6000D box.
+ * ../allreduce_sm100_sm120/README.md §4.6 has the measured table for an 8-GPU RTX 6000D box.
  *
  * Build:
  *   nvcc -std=c++17 -O2 -arch=sm_100 -o minimal_p2p_copy_engine minimal_p2p_copy_engine.cu
