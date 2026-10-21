@@ -30,7 +30,7 @@ Headline (two-shot, 8 GPUs, clocks locked, µs; **fused NVFP4 vs TRT-LLM FP8**):
 | RTX 6000D ×8 (PCIe), best grid both | PCIe | **6.1×** (32K) · **4.6×** (128K) · **2.9×** (512K) | **1.76×** (8M) | — | — |
 | RTX PRO 6000 ×8 (PCIe), best grid both | PCIe | **4.8×** (32K) · **3.6×** (128K) · **2.6×** (512K) | **2.1×** (8M) | — | — |
 
-**vs NCCL 2.30.7 on the 8× RTX 6000D (same box, §4.1):** 2.6× (16 MB) / 2.7× (64 MB) vs NCCL's best BF16 path, 3.6× / 5.1× vs NCCL's default; below ~1 MB NCCL is faster.
+**vs NCCL 2.30.7 on the 8× RTX 6000D, same wire path (same box, §4.1):** over the NICs (GPUDirect RDMA) NVFP4 is 2.6× (16 MB) / 2.7× (64 MB) faster than NCCL BF16 and 1.3× / 1.7× faster than NCCL FP8; on the SM path NCCL is up to 10× faster; on the copy-engine path they tie; at ≤1 MB NCCL's best path (SM) is faster than NVFP4's best.
 vs TRT-LLM BF16 custom AR the fused NVFP4 kernel is 3.9–11.8× faster on NVLink (≥8M) and 2.3–6.3× on PCIe (best grid).
 **PCIe caveat:** TRT-FP8 with 1 block instead of its fixed 16 is up to 2.6× faster on the 6000D; the PCIe ratios above give TRT-FP8 that best grid (§4.1).
 One-shot: the fused NVFP4 one-shot beats TRT-LLM's BF16 one-shot at every size on NVLink (1.1× on the 16 µs latency floor, 5–8× from 8M up) and 4.4–5.6× on PCIe.
@@ -378,28 +378,48 @@ Notes.
 - `ce` (56 concurrent `cudaMemcpyPeerAsync`) tops out at 9–11 GB/s per rank and never beats `rdma`.
 - Accuracy: `ce` and `rdma` are bit-identical; `sm` differs in the 4th digit (reduction order).
 
-**vs NCCL** (same 8× RTX 6000D box, same session, `-lgc` max; NCCL 2.30.7 from `nvcr.io/nvidia/pytorch:26.07-py3`,
-`all_reduce_perf -g 8 -w 20 -n 100`, out-of-place). NCCL has all three wire paths too, so every NCCL column is the
-best of: default (ring over `P2P` within a PCIe switch + `SHM` across it, SM-driven), copy engine
-(`NCCL_P2P_USE_CUDA_MEMCPY=1 NCCL_SHM_USE_CUDA_MEMCPY=1` → `P2P/CUMEM/CE`), and NIC
-(`NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1` → `NET/…/GDRDMA` through the host's own NICs). NCCL's low-precision
-option is FP8 input buffers (`-d f8e4m3`, 1 B/elt on the wire, no block scales). NVFP4 = fastest of the
-`bench_ar_pcie` variants (two-shot `sm` grid 1/2/4, `ce`, `rdma`; one-shot `sm`/`ce`/`rdma`), rerun in the same session.
+**vs NCCL, same wire path** (same 8× RTX 6000D box, same session, `-lgc` max; NCCL 2.30.7 from
+`nvcr.io/nvidia/pytorch:26.07-py3`, `all_reduce_perf -g 8 -w 20 -n 100`, out-of-place µs). Both sides get the same three
+wire paths and each cell is the fastest variant on that path (NVFP4: two-shot / one-shot, `bench_ar_pcie` rerun in the same
+session, in-kernel grid 1/2/4). NCCL paths:
 
-| numel (BF16 bytes) | NCCL BF16 best (path) | NCCL BF16 default | NCCL FP8 best (path) | NVFP4 best (variant) | vs NCCL BF16 best | vs NCCL BF16 default | vs NCCL FP8 best |
-|---:|---:|---:|---:|---:|:--:|:--:|:--:|
-| 32K (64 KB) | **29** (SM) | 29 | 26 (SM) | 34 (two-shot `sm`) | 0.85× | 0.85× | 0.76× |
-| 128K (256 KB) | **50** (SM) | 50 | 33 (SM) | 96 (two-shot `sm`) | 0.52× | 0.52× | 0.34× |
-| 512K (1 MB) | 161 (SM) | 161 | 91 (SM) | **134** (one-shot `rdma`) | 1.21× | 1.21× | 0.68× |
-| 8M (16 MB) | 866 (NIC) | 1189 | 423 (NIC) | **329** (two-shot `rdma`) | **2.6×** | **3.6×** | 1.29× |
-| 32M (64 MB) | 2559 (NIC) | 4880 | 1648 (NIC) | **948** (two-shot `rdma`) | **2.7×** | **5.1×** | 1.74× |
+| path | NCCL environment | NCCL transport (from `NCCL_DEBUG=INFO`) |
+|---|---|---|
+| SM | default, and `NCCL_P2P_LEVEL=SYS NCCL_SHM_DISABLE=1 NCCL_NET_DISABLE_INTRA=1 NCCL_IB_DISABLE=1` (faster of the two) | default: `P2P` within a PCIe switch + `SHM` across; second: `P2P` between all pairs |
+| copy engine | the pure-P2P set above + `NCCL_P2P_USE_CUDA_MEMCPY=1` | `P2P/CUMEM/CE` between all pairs |
+| NIC (GPUDirect RDMA) | `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1` | `NET/…/GDRDMA` through the host's own NICs |
 
-- Below ~1M NCCL's LL protocol over P2P/SHM wins: the NVFP4 in-kernel path pays the 8-way PCIe all-to-all
-  (~1 GB/s per rank, §4.6) and the RDMA path a ~90–160 µs host floor.
-- From 8M up NVFP4 over RDMA is 2.6–2.7× faster than the best NCCL BF16 path and 3.6–5.1× faster than NCCL as
-  shipped (NCCL keeps P2P/SHM by default; forcing it onto the NICs is itself 1.4–1.9× faster at these sizes).
-- NCCL FP8 moves 1.78× the NVFP4 bytes; NVFP4 is 1.3–1.7× faster there at 8M–32M. Accuracy of NCCL FP8 was not measured.
-- NVFP4 numbers from this session agree with the table above within 3–6 %.
+NCCL BF16 vs NVFP4 (BF16 in, BF16 out; ratio = NCCL / NVFP4, >1 means NVFP4 is faster):
+
+| numel (BF16 bytes) | SM: NCCL | SM: NVFP4 | SM | CE: NCCL | CE: NVFP4 | CE | NIC: NCCL | NIC: NVFP4 | NIC |
+|---:|---:|---:|:--:|---:|---:|:--:|---:|---:|:--:|
+| 32K (64 KB) | 29 | 34 | 0.85× | 278 | 229 | 1.21× | 84 | 93 | 0.91× |
+| 128K (256 KB) | 50 | 96 | 0.52× | 275 | 218 | 1.26× | 104 | 100 | 1.04× |
+| 512K (1 MB) | 90 | 377 | 0.24× | 341 | 307 | 1.11× | 233 | 134 | 1.75× |
+| 8M (16 MB) | 781 | 7402 | 0.11× | 902 | 815 | 1.11× | 866 | 329 | **2.63×** |
+| 32M (64 MB) | 3066 | 31861 | 0.10× | 2969 | 3071 | 0.97× | 2559 | 948 | **2.70×** |
+
+NCCL's low-precision option is FP8 input buffers (`-d f8e4m3`: 1 B/elt on the wire, no block scales, the caller does the
+BF16→FP8 cast — not included in these times; NVFP4 times include quantize/dequantize). NCCL FP8 vs NVFP4:
+
+| numel | SM: NCCL FP8 | SM | CE: NCCL FP8 | CE | NIC: NCCL FP8 | NIC |
+|---:|---:|:--:|---:|:--:|---:|:--:|
+| 32K | 26 | 0.76× | 268 | 1.17× | 67 | 0.72× |
+| 128K | 33 | 0.34× | 268 | 1.23× | 85 | 0.85× |
+| 512K | 85 | 0.23× | 284 | 0.92× | 130 | 0.97× |
+| 8M | 402 | 0.05× | 583 | 0.72× | 423 | **1.29×** |
+| 32M | 1564 | 0.05× | 1460 | 0.48× | 1648 | **1.74×** |
+
+Best path vs best path (any transport each side): NVFP4 / NCCL BF16 = 0.85× · 0.52× · 0.67× · **2.37×** · **2.70×**
+(NCCL's best: SM up to 16 MB, NIC at 64 MB); NVFP4 / NCCL FP8 = 0.76× · 0.34× · 0.64× · **1.22×** · **1.54×**.
+
+- **NIC path (same transport as NVFP4's fastest): NVFP4 is 2.6–2.7× faster than NCCL BF16 and 1.3–1.7× faster than NCCL FP8 at 16–64 MB.**
+- **SM path: NCCL wins by up to 10×.** NCCL's ring moves each byte over one PCIe hop per step; the NVFP4 in-kernel
+  two-shot is an 8-way all-to-all of peer stores, which runs at ~1 GB/s per rank on this switch-less host (§4.6).
+  The 3.56× smaller payload does not make up for the access pattern — this is the open item of §4.6.
+- **Copy engine: roughly a tie** (0.97–1.26× vs BF16); NCCL's CE path has a ~270 µs floor, the NVFP4 one ~220 µs.
+- NCCL picks SM (P2P + SHM) by default; at 16–64 MB its own pure-P2P and NIC paths are 1.4–1.9× faster than that default.
+- NVFP4 numbers from this session agree with the §4.1 tables within 3–6 %. Accuracy of NCCL FP8 was not measured.
 
 ### 4.2 PCIe — RTX PRO 6000 Blackwell SE, 8 GPUs, sm_120, locked 2295–2347 MHz (µs)
 
@@ -640,4 +660,4 @@ decode (PRMT or hardware cvt) fixes that, and after it the access pattern (§2.4
 7. TRT-LLM's `block_barrier` publishes its flag without a preceding `__syncthreads()`; on PCIe with many blocks this is a real race (its BF16 one-shot is non-deterministic there). The NVFP4 kernels add the `__syncthreads()`; `-DTRT_BARRIER_FIX` shows the fix on the verbatim kernels (§2.5).
 6. The E2M1 hardware `cvt` exists on every Blackwell including sm_120; build with explicit `-gencode …a`.
 8. **On PCIe hosts the wire, not the format, is the bottleneck.** SM stores across the root complex give ~1 GB/s per rank for every in-kernel all-reduce (ours and TRT-LLM's). Moving the NVFP4 slices with GPUDirect RDMA through the host's own NICs (FlashInfer PR #4876's recipe) reaches 34–43 GB/s per rank: 8M in 341 µs vs 7969 µs in-kernel, 14056 µs TRT-FP8 and 49833 µs TRT-BF16 (§4.1, §4.6). The ~160 µs host-orchestration floor leaves the in-kernel kernel the winner below ~256K.
-9. **vs NCCL on the 8× RTX 6000D (same box, §4.1):** from 8M (16 MB BF16) up, NVFP4 over RDMA is 2.6–2.7× faster than NCCL's best BF16 path (NIC), 3.6–5.1× faster than NCCL's default (P2P/SHM) and 1.3–1.7× faster than NCCL FP8; below ~1M NCCL's LL protocol is faster (0.5–0.85×).
+9. **vs NCCL on the 8× RTX 6000D, path for path (§4.1):** NIC/GPUDirect RDMA — NVFP4 2.6–2.7× faster than NCCL BF16 and 1.3–1.7× than NCCL FP8 at 16–64 MB; copy engine — a tie (0.97–1.26×); SM — NCCL's ring is up to 10× faster than the NVFP4 in-kernel all-to-all. Best path vs best path: 2.4–2.7× vs NCCL BF16, 1.2–1.5× vs NCCL FP8 at 16–64 MB; NCCL is faster below ~1 MB.
