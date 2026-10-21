@@ -30,7 +30,7 @@ Headline (two-shot, 8 GPUs, clocks locked, µs; **fused NVFP4 vs TRT-LLM FP8**):
 | RTX 6000D ×8 (PCIe), best grid both | PCIe | **6.1×** (32K) · **4.6×** (128K) · **2.9×** (512K) | **1.76×** (8M) | — | — |
 | RTX PRO 6000 ×8 (PCIe), best grid both | PCIe | **4.8×** (32K) · **3.6×** (128K) · **2.6×** (512K) | **2.1×** (8M) | — | — |
 
-**vs NCCL 2.30.7 on the 8× RTX 6000D, same wire path (same box, §4.1):** over the NICs (GPUDirect RDMA) NVFP4 is 2.6× (16 MB) / 2.7× (64 MB) faster than NCCL BF16 and 1.3× / 1.7× faster than NCCL FP8; on the SM path NCCL is up to 10× faster; on the copy-engine path they tie; at ≤1 MB NCCL's best path (SM) is faster than NVFP4's best.
+**vs NCCL 2.30.7 FP8 (its lowest precision; NCCL has no FP4) on the 8× RTX 6000D, same wire path (same box, §4.1):** over the NICs (GPUDirect RDMA) NVFP4 is 1.29× (8M elements) / 1.74× (32M) faster than NCCL FP8 (2.6× / 2.7× vs NCCL BF16); on the SM path NCCL is up to 10× faster; on the copy-engine path they tie; at ≤1 MB NCCL's best path (SM) is faster than NVFP4's best.
 vs TRT-LLM BF16 custom AR the fused NVFP4 kernel is 3.9–11.8× faster on NVLink (≥8M) and 2.3–6.3× on PCIe (best grid).
 **PCIe caveat:** TRT-FP8 with 1 block instead of its fixed 16 is up to 2.6× faster on the 6000D; the PCIe ratios above give TRT-FP8 that best grid (§4.1).
 One-shot: the fused NVFP4 one-shot beats TRT-LLM's BF16 one-shot at every size on NVLink (1.1× on the 16 µs latency floor, 5–8× from 8M up) and 4.4–5.6× on PCIe.
